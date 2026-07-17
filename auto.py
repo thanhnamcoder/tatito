@@ -182,14 +182,15 @@ def click_image(
     region=None,
     stable_count=3
 ):
+    # Nếu tên file có chứa tọa độ thì dùng làm vùng tìm kiếm
     coords = extract_coords_from_image_path(image_path)
-    if coords:
-        click_x = coords["x"] + coords["w"] // 2
-        click_y = coords["y"] + coords["h"] // 2
-        pyautogui.moveTo(click_x, click_y, duration=0.1)
-        pyautogui.click()
-        log(f"Clicked by coords: {image_path} -> ({click_x}, {click_y})")
-        return True
+    if coords and region is None:
+        region = (
+            coords["x"],
+            coords["y"],
+            coords["w"],
+            coords["h"]
+        )
 
     last_pos = None
     stable = 0
@@ -200,14 +201,18 @@ def click_image(
         pos = wait_image(
             image_path=image_path,
             confidence=confidence,
-            timeout=interval,      # mỗi lần chỉ chờ interval
+            timeout=interval,
             interval=0.05,
             region=region
         )
 
         if pos:
 
-            if last_pos is not None and abs(last_pos.x - pos.x) <= 2 and abs(last_pos.y - pos.y) <= 2:
+            if (
+                last_pos is not None
+                and abs(last_pos.x - pos.x) <= 2
+                and abs(last_pos.y - pos.y) <= 2
+            ):
                 stable += 1
             else:
                 stable = 1
@@ -219,7 +224,6 @@ def click_image(
                 pyautogui.click()
 
                 log(f"Clicked: {image_path}")
-
                 return True
 
         time.sleep(interval)
@@ -228,7 +232,6 @@ def click_image(
     log(f"Timeout: {image_path}")
 
     return False
-
 
 # ==========================
 # KIỂM TRA ẢNH
