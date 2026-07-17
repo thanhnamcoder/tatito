@@ -13,7 +13,7 @@ import json
 
 pyautogui.FAILSAFE = True      # Đưa chuột lên góc trái để dừng script
 pyautogui.PAUSE = 0.1          # Nghỉ 0.1s sau mỗi thao tác
-CONFIG_FILE = "config.json"
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 WEEKDAY_NAME = [
     "Thứ 2",
     "Thứ 3",

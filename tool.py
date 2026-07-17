@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication,
@@ -13,13 +14,67 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QRubberBand,
     QInputDialog,
+    QMainWindow,
+    QAction,
+    QToolBar,
+    QDialog,
+    QSizePolicy,
+    QShortcut,
+    QComboBox,
+    QLineEdit,
+    QListWidget,
+    QFormLayout,
+    QTimeEdit,
 )
-from PyQt5.QtCore import Qt, QPoint, QRect, QSize, QTimer, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QPoint, QRect, QSize, QTimer, QThread, pyqtSignal, QTime
 from PyQt5.QtGui import QPainter, QColor, QKeySequence, QPixmap
-from PyQt5.QtWidgets import QShortcut, QSizePolicy
 from auto import click_image as auto_click_image
 import re
 import unicodedata
+
+
+WEEKDAY_OPTIONS = [
+    ("Thứ 2", "0"),
+    ("Thứ 3", "1"),
+    ("Thứ 4", "2"),
+    ("Thứ 5", "3"),
+    ("Thứ 6", "4"),
+    ("Thứ 7", "5"),
+    ("Chủ nhật", "6"),
+]
+
+
+def build_default_schedule():
+    return {
+        "schedule": {
+            "0": {},
+            "1": {},
+            "2": {},
+            "3": {
+                "test1": {"start": "19:24", "end": "23:26"},
+                "test2": {"start": "19:26", "end": "19:27"},
+            },
+            "4": {
+                "test1": {"start": "21:04", "end": "21:04"},
+                "test2": {"start": "21:05", "end": "21:05"},
+            },
+            "5": {},
+            "6": {},
+        }
+    }
+
+
+def load_config_file(path):
+    if not os.path.exists(path):
+        return build_default_schedule()
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_config_file(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+        f.write("\n")
 
 
 def sanitize_filename_part(name):
@@ -213,7 +268,173 @@ class ElidedLabel(QLabel):
         super().setText(elided)
 
 
-class MainWindow(QWidget):
+class ConfigEditorDialog(QDialog):
+    def __init__(self, parent, config_path):
+        super().__init__(parent)
+        self.config_path = config_path
+        self.setWindowTitle("Cấu hình lịch")
+        self.resize(760, 520)
+
+        self.schedule_data = load_config_file(config_path)
+        if not isinstance(self.schedule_data, dict):
+            self.schedule_data = build_default_schedule()
+        if "schedule" not in self.schedule_data or not isinstance(self.schedule_data["schedule"], dict):
+            self.schedule_data["schedule"] = {}
+
+        layout = QVBoxLayout(self)
+        info_label = QLabel(
+            "Chọn ngày, nhập tên job và thời gian bắt đầu/kết thúc."
+            "\nHệ thống sẽ tự lưu vào file cấu hình."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("padding: 6px; background: #f5f5f5; border-radius: 4px;")
+        layout.addWidget(info_label)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Ngày:"))
+        self.day_combo = QComboBox(self)
+        for label, value in WEEKDAY_OPTIONS:
+            self.day_combo.addItem(label, value)
+        self.day_combo.currentIndexChanged.connect(self.on_day_changed)
+        top_row.addWidget(self.day_combo, 1)
+        layout.addLayout(top_row)
+
+        body_row = QHBoxLayout()
+
+        left_panel = QFrame(self)
+        left_panel.setFrameShape(QFrame.StyledPanel)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.addWidget(QLabel("Danh sách job"))
+        self.job_list = QListWidget(self)
+        self.job_list.itemSelectionChanged.connect(self.on_job_selected)
+        left_layout.addWidget(self.job_list, 1)
+        body_row.addWidget(left_panel, 1)
+
+        right_panel = QFrame(self)
+        right_panel.setFrameShape(QFrame.StyledPanel)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.addWidget(QLabel("Thông tin job"))
+
+        form_layout = QFormLayout()
+        self.job_name_input = QLineEdit(self)
+        self.start_time_input = QTimeEdit(self)
+        self.start_time_input.setDisplayFormat("HH:mm")
+        self.end_time_input = QTimeEdit(self)
+        self.end_time_input.setDisplayFormat("HH:mm")
+
+        form_layout.addRow("Tên job:", self.job_name_input)
+        form_layout.addRow("Bắt đầu:", self.start_time_input)
+        form_layout.addRow("Kết thúc:", self.end_time_input)
+        right_layout.addLayout(form_layout)
+
+        action_row = QHBoxLayout()
+        add_btn = QPushButton("Thêm / Cập nhật")
+        add_btn.clicked.connect(self.on_add_or_update_job)
+        remove_btn = QPushButton("Xóa")
+        remove_btn.clicked.connect(self.on_remove_job)
+        action_row.addWidget(add_btn)
+        action_row.addWidget(remove_btn)
+        right_layout.addLayout(action_row)
+        right_layout.addStretch(1)
+        body_row.addWidget(right_panel, 1)
+
+        layout.addLayout(body_row, 1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        save_btn = QPushButton("Lưu")
+        save_btn.clicked.connect(self.on_save)
+        cancel_btn = QPushButton("Hủy")
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addWidget(save_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+
+        self.refresh_job_list()
+
+    def current_day_key(self):
+        return self.day_combo.currentData()
+
+    def refresh_job_list(self):
+        self.job_list.clear()
+        day_key = self.current_day_key()
+        day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(day_key, {})
+
+        for job_name in sorted(day_cfg.keys()):
+            cfg = day_cfg[job_name]
+            start = cfg.get("start", "")
+            end = cfg.get("end", "")
+            self.job_list.addItem(f"{job_name}  ({start} -> {end})")
+
+        self.job_name_input.clear()
+        self.start_time_input.setTime(QTime(0, 0))
+        self.end_time_input.setTime(QTime(0, 0))
+
+    def on_day_changed(self):
+        self.refresh_job_list()
+
+    def on_job_selected(self):
+        selected_items = self.job_list.selectedItems()
+        if not selected_items:
+            return
+
+        text = selected_items[0].text()
+        job_name = text.split("  (", 1)[0]
+        day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(self.current_day_key(), {})
+        cfg = day_cfg.get(job_name, {})
+
+        self.job_name_input.setText(job_name)
+        start_time = cfg.get("start", "00:00")
+        end_time = cfg.get("end", "00:00")
+
+        try:
+            self.start_time_input.setTime(QTime.fromString(start_time, "HH:mm"))
+            self.end_time_input.setTime(QTime.fromString(end_time, "HH:mm"))
+        except Exception:
+            self.start_time_input.setTime(QTime(0, 0))
+            self.end_time_input.setTime(QTime(0, 0))
+
+    def on_add_or_update_job(self):
+        job_name = self.job_name_input.text().strip()
+        if not job_name:
+            QMessageBox.warning(self, "Cấu hình", "Vui lòng nhập tên job.")
+            return
+
+        day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(self.current_day_key(), {})
+        day_cfg[job_name] = {
+            "start": self.start_time_input.time().toString("HH:mm"),
+            "end": self.end_time_input.time().toString("HH:mm"),
+        }
+        self.refresh_job_list()
+
+        for index in range(self.job_list.count()):
+            if self.job_list.item(index).text().startswith(job_name + "  ("):
+                self.job_list.setCurrentRow(index)
+                break
+
+    def on_remove_job(self):
+        selected_items = self.job_list.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "Cấu hình", "Chọn một job để xóa.")
+            return
+
+        job_name = selected_items[0].text().split("  (", 1)[0]
+        day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(self.current_day_key(), {})
+        day_cfg.pop(job_name, None)
+        self.refresh_job_list()
+
+    def on_save(self):
+        try:
+            save_config_file(self.config_path, self.schedule_data)
+        except Exception as e:
+            QMessageBox.warning(self, "Cấu hình", f"Không thể lưu file:\n{e}")
+            return
+
+        QMessageBox.information(self, "Cấu hình", "Đã lưu cấu hình thành công.")
+        self.accept()
+
+
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("App")
@@ -227,10 +448,15 @@ class MainWindow(QWidget):
         self.gallery_files = []  # keep current display order of filenames
         self.gallery_test_threads = []  # giữ tham chiếu các thread Test trong gallery
         self.active_test_count = 0  # đếm số lượt test đang chạy để ẩn/hiện cửa sổ đúng lúc
+        self.config_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
         self.init_ui()
 
     def init_ui(self):
-        main_layout = QVBoxLayout(self)
+        self.central_widget = QWidget(self)
+        self.setCentralWidget(self.central_widget)
+        self.create_toolbar()
+
+        main_layout = QVBoxLayout(self.central_widget)
 
         # Left frame with buttons
         left_frame = QFrame(self)
@@ -354,6 +580,20 @@ class MainWindow(QWidget):
         main_layout.addWidget(right_frame, 1)
 
         self.refresh_images_gallery()
+
+    def create_toolbar(self):
+        toolbar = QToolBar("Công cụ")
+        toolbar.setMovable(False)
+        self.addToolBar(Qt.TopToolBarArea, toolbar)
+
+        action_config = QAction("Config", self)
+        action_config.setToolTip("Mở cửa sổ cấu hình lịch")
+        action_config.triggered.connect(self.open_config_dialog)
+        toolbar.addAction(action_config)
+
+    def open_config_dialog(self):
+        dialog = ConfigEditorDialog(self, self.config_file_path)
+        dialog.exec_()
 
     def on_select_area(self):
         # Ẩn cửa sổ chính trước, đợi 1 chút cho hiệu ứng ẩn hoàn tất
