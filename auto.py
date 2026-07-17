@@ -14,7 +14,15 @@ import json
 pyautogui.FAILSAFE = True      # Đưa chuột lên góc trái để dừng script
 pyautogui.PAUSE = 0.1          # Nghỉ 0.1s sau mỗi thao tác
 CONFIG_FILE = "config.json"
-
+WEEKDAY_NAME = [
+    "Thứ 2",
+    "Thứ 3",
+    "Thứ 4",
+    "Thứ 5",
+    "Thứ 6",
+    "Thứ 7",
+    "Chủ nhật"
+]
 
 # ==========================
 # LOG
@@ -290,6 +298,21 @@ def load_config():
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def print_next_day_schedule(config, date):
+    weekday = str(date.weekday())
+    day_cfg = config.get("schedule", {}).get(weekday, {})
+
+    print(f"\n===== Lịch {WEEKDAY_NAME[date.weekday()]} ({date:%d/%m/%Y}) =====")
+
+    if not day_cfg:
+        print(f"{WEEKDAY_NAME[date.weekday()]} không có lịch.")
+        return
+
+    for job_name, cfg in day_cfg.items():
+        print(
+            f"- {job_name}: "
+            f"{cfg.get('start')} -> {cfg.get('end')}"
+        )
 
 def scheduler():
 
@@ -388,9 +411,17 @@ def scheduler():
             microsecond=0
         )
 
-        time.sleep(
-            (tomorrow - datetime.now()).total_seconds()
+        print(f"\nĐã hoàn thành lịch {WEEKDAY_NAME[datetime.now().weekday()]}.")
+        print_next_day_schedule(config, tomorrow.date())
+
+        sleep_time = (tomorrow - datetime.now()).total_seconds()
+
+        print(
+            f"Chờ {int(sleep_time)} giây đến "
+            f"{tomorrow:%d/%m/%Y %H:%M:%S}\n"
         )
+
+        time.sleep(sleep_time)
 # ==========================
 # DEMO
 # ==========================
