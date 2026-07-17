@@ -7,6 +7,7 @@ import pyautogui
 from datetime import datetime, timedelta
 import random
 import json
+import re
 # ==========================
 # CẤU HÌNH
 # ==========================
@@ -141,6 +142,35 @@ def wait_image(
 
 
 # ==========================
+# TÁCH TỌA ĐỘ TỪ TÊN ẢNH
+# ==========================
+
+def extract_coords_from_image_path(image_path):
+    if not image_path:
+        return None
+
+    base_name = os.path.basename(image_path)
+    name, _ = os.path.splitext(base_name)
+
+    patterns = [
+        r"^(?P<base>.*)=(?P<x>-?\d+)_(?P<y>-?\d+)_(?P<w>\d+)_(?P<h>\d+)=$",
+        r"^(?P<base>.*)_(?P<x>-?\d+)_(?P<y>-?\d+)_(?P<w>\d+)_(?P<h>\d+)$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, name)
+        if match:
+            return {
+                "x": int(match.group("x")),
+                "y": int(match.group("y")),
+                "w": int(match.group("w")),
+                "h": int(match.group("h")),
+            }
+
+    return None
+
+
+# ==========================
 # CLICK ẢNH
 # ==========================
 
@@ -152,6 +182,15 @@ def click_image(
     region=None,
     stable_count=3
 ):
+    coords = extract_coords_from_image_path(image_path)
+    if coords:
+        click_x = coords["x"] + coords["w"] // 2
+        click_y = coords["y"] + coords["h"] // 2
+        pyautogui.moveTo(click_x, click_y, duration=0.1)
+        pyautogui.click()
+        log(f"Clicked by coords: {image_path} -> ({click_x}, {click_y})")
+        return True
+
     last_pos = None
     stable = 0
     start = time.time()

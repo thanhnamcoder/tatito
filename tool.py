@@ -707,7 +707,7 @@ class MainWindow(QMainWindow):
 
         # Tạo tên cuối cùng bằng cách ghép tên người dùng + toạ độ (nếu có) + .png
         if coords_str:
-            final_name = f"{name}_{coords_str}.png"
+            final_name = f"{name}={coords_str}=.png"
         else:
             final_name = f"{name}.png"
 
@@ -862,11 +862,15 @@ class MainWindow(QMainWindow):
         basename = os.path.basename(file_path)
         old_name, old_ext = os.path.splitext(basename)
 
-        # Detect trailing coords pattern _x_y_w_h at end of base name
-        m = re.search(r"_(\-?\d+)_(-?\d+)_(\d+)_(\d+)$", old_name)
+        # Detect coords pattern at the end of the base name, supporting both
+        # old format: name_0_180_60_52 and new format: name=0_180_60_52=
+        m = re.search(r"^(?P<base>.*)=(?P<x>-?\d+)_(?P<y>-?\d+)_(?P<w>\d+)_(?P<h>\d+)=$", old_name)
+        if not m:
+            m = re.search(r"^(?P<base>.*)_(?P<x>-?\d+)_(?P<y>-?\d+)_(?P<w>\d+)_(?P<h>\d+)$", old_name)
+
         if m:
-            coords = f"{m.group(1)}_{m.group(2)}_{m.group(3)}_{m.group(4)}"
-            base_no_coords = old_name[: m.start()]
+            coords = f"{m.group('x')}_{m.group('y')}_{m.group('w')}_{m.group('h')}"
+            base_no_coords = m.group('base')
         else:
             coords = None
             base_no_coords = old_name
@@ -889,9 +893,9 @@ class MainWindow(QMainWindow):
 
         new_root = sanitize_filename_part(new_root)
 
-        # Construct final basename: new_root + _coords (if existed) + ext
+        # Construct final basename: new_root + =coords= (if existed) + ext
         if coords:
-            final_basename = f"{new_root}_{coords}{new_ext}"
+            final_basename = f"{new_root}={coords}={new_ext}"
         else:
             final_basename = f"{new_root}{new_ext}"
 
