@@ -11,12 +11,10 @@
         },
         "3": {
                         "test1": {
-                "enable": true,
                 "start": "19:24",
                 "end": "19:26"
             },
             "test2": {
-                "enable": true,
                 "start": "19:26",
                 "end": "19:27"
             }

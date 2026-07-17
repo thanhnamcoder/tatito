@@ -14,9 +14,48 @@ from PyQt5.QtWidgets import (
     QRubberBand,
     QInputDialog,
 )
-from PyQt5.QtCore import Qt, QPoint, QRect, QSize, QTimer
+from PyQt5.QtCore import Qt, QPoint, QRect, QSize, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QKeySequence, QPixmap
 from PyQt5.QtWidgets import QShortcut, QSizePolicy
+from auto import click_image as auto_click_image
+import re
+import unicodedata
+
+
+def sanitize_filename_part(name):
+    if name is None:
+        return "file"
+
+    text = str(name).strip()
+    if not text:
+        return "file"
+
+    # Chuyển về dạng ASCII cơ bản, loại bỏ dấu tiếng Việt
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+
+    # Bổ sung một số ký tự đặc biệt thường gặp
+    text = text.translate(
+        str.maketrans({
+            "đ": "d",
+            "Đ": "D",
+            "ß": "ss",
+            "Æ": "AE",
+            "æ": "ae",
+            "Œ": "OE",
+            "œ": "oe",
+            "ł": "l",
+            "Ł": "L",
+            "þ": "th",
+            "Þ": "TH",
+        })
+    )
+
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+
+    return text or "file"
 
 
 class SelectionOverlay(QWidget):
@@ -131,6 +170,26 @@ class PositionPickerOverlay(QWidget):
             self.on_finished(None)
 
 
+class ClickTestThread(QThread):
+    """
+    Chạy auto_click_image() ở luồng riêng để không làm treo giao diện
+    (vì click_image có thể chờ/lặp trong nhiều giây).
+    """
+
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, image_path):
+        super().__init__()
+        self.image_path = image_path
+
+    def run(self):
+        try:
+            result = auto_click_image(self.image_path, timeout=5)
+            self.finished_signal.emit(bool(result), "")
+        except Exception as e:
+            self.finished_signal.emit(False, str(e))
+
+
 class ElidedLabel(QLabel):
     """QLabel that automatically elides long text with '...' when resized."""
 
@@ -161,10 +220,13 @@ class MainWindow(QWidget):
         self.setMinimumSize(700, 400)
         self.overlay = None
         self.selected_rect = None
+        self.captured_rect = None
         self.captured_pixmap = None
         self.captured_image_path = None
         self.mouse_position = None
         self.gallery_files = []  # keep current display order of filenames
+        self.gallery_test_threads = []  # giữ tham chiếu các thread Test trong gallery
+        self.active_test_count = 0  # đếm số lượt test đang chạy để ẩn/hiện cửa sổ đúng lúc
         self.init_ui()
 
     def init_ui(self):
@@ -225,10 +287,20 @@ class MainWindow(QWidget):
         self.capture_result_label.setStyleSheet("padding: 4px; font-size: 11px;")
         capture_layout.addWidget(self.capture_result_label, alignment=Qt.AlignHCenter)
 
+        copy_test_row = QHBoxLayout()
+        copy_test_row.setSpacing(6)
+
         self.btn_copy_capture = QPushButton("Copy")
-        self.btn_copy_capture.setFixedWidth(button_width)
+        self.btn_copy_capture.setFixedWidth((button_width - 6) // 2)
         self.btn_copy_capture.clicked.connect(self.on_copy_capture)
-        capture_layout.addWidget(self.btn_copy_capture, alignment=Qt.AlignHCenter)
+        copy_test_row.addWidget(self.btn_copy_capture)
+
+        self.btn_test_capture = QPushButton("Test")
+        self.btn_test_capture.setFixedWidth((button_width - 6) // 2)
+        self.btn_test_capture.clicked.connect(self.on_test_capture)
+        copy_test_row.addWidget(self.btn_test_capture)
+
+        capture_layout.addLayout(copy_test_row)
         button_row.addLayout(capture_layout)
 
         self.btn_get_mouse_position = QPushButton("Lấy vị trí chuột")
@@ -329,6 +401,9 @@ class MainWindow(QWidget):
             self.capture_result_label.setText("Đã hủy chọn")
             return
 
+        # store the captured rect so we can use its coords when saving
+        self.captured_rect = rect
+
         # Đợi 1 chút để overlay biến mất hoàn toàn khỏi màn hình
         # (tránh chụp phải lớp phủ mờ / viền rubber band còn sót lại),
         # rồi mới thực sự chụp ảnh.
@@ -358,20 +433,43 @@ class MainWindow(QWidget):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "Images")
 
     def save_captured_image(self, pixmap):
-        # Hỏi tên file để lưu ảnh
-        default_name = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # Hỏi tên file để lưu ảnh (hiển thị tên cơ sở không gồm toạ độ)
+        default_base = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # chuẩn bị chuỗi toạ độ (mở rộng 10px mỗi cạnh) nhưng không hiển thị
+        coords_str = ""
+        try:
+            if hasattr(self, "captured_rect") and self.captured_rect is not None:
+                r = self.captured_rect
+                x = max(0, r.x() - 10)
+                y = max(0, r.y() - 10)
+                w = r.width() + 20
+                h = r.height() + 20
+                coords_str = f"{x}_{y}_{w}_{h}"
+        except Exception:
+            coords_str = ""
+
         name, ok = QInputDialog.getText(
             self,
             "Lưu ảnh",
             "Nhập tên file (không cần đuôi .png):",
-            text=default_name,
+            text=default_base,
         )
         if not ok or not name.strip():
             return
 
         name = name.strip()
-        if not name.lower().endswith(".png"):
-            name += ".png"
+        # Nếu người dùng nhập .png thì bỏ phần ext để chúng ta tự gắn lại sau khi ghép coords
+        if name.lower().endswith('.png'):
+            name = name[:-4]
+
+        name = sanitize_filename_part(name)
+
+        # Tạo tên cuối cùng bằng cách ghép tên người dùng + toạ độ (nếu có) + .png
+        if coords_str:
+            final_name = f"{name}_{coords_str}.png"
+        else:
+            final_name = f"{name}.png"
 
         images_dir = self.get_images_dir()
         try:
@@ -380,13 +478,13 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Lưu ảnh", f"Không thể tạo thư mục Images:\n{e}")
             return
 
-        save_path = os.path.join(images_dir, name)
+        save_path = os.path.join(images_dir, final_name)
 
         if os.path.exists(save_path):
             reply = QMessageBox.question(
                 self,
                 "File đã tồn tại",
-                f"File \"{name}\" đã tồn tại. Bạn có muốn ghi đè không?",
+                f"File \"{final_name}\" đã tồn tại. Bạn có muốn ghi đè không?",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
@@ -487,6 +585,13 @@ class MainWindow(QWidget):
             )
             row_layout.addWidget(btn_delete)
 
+            btn_test = QPushButton("Test")
+            btn_test.setFixedWidth(70)
+            btn_test.clicked.connect(
+                lambda checked=False, path=file_path, btn=btn_test: self.on_test_image(path, btn)
+            )
+            row_layout.addWidget(btn_test)
+
             self.gallery_layout.addWidget(row_widget)
 
     def on_copy_image_path(self, file_path):
@@ -516,33 +621,57 @@ class MainWindow(QWidget):
         dirpath = os.path.dirname(file_path)
         basename = os.path.basename(file_path)
         old_name, old_ext = os.path.splitext(basename)
-        new_name, ok = QInputDialog.getText(
+
+        # Detect trailing coords pattern _x_y_w_h at end of base name
+        m = re.search(r"_(\-?\d+)_(-?\d+)_(\d+)_(\d+)$", old_name)
+        if m:
+            coords = f"{m.group(1)}_{m.group(2)}_{m.group(3)}_{m.group(4)}"
+            base_no_coords = old_name[: m.start()]
+        else:
+            coords = None
+            base_no_coords = old_name
+
+        # Show input with the prefix only (without coords) so user edits only that part
+        new_input, ok = QInputDialog.getText(
             self,
             "Đổi tên",
-            "Nhập tên mới (có thể kèm đuôi):",
-            text=old_name,
+            "Chỉ sửa phần tên trước toạ độ (phần toạ độ được giữ tự động):",
+            text=base_no_coords,
         )
-        if not ok or not new_name.strip():
+        if not ok or not new_input.strip():
             return
-        new_name = new_name.strip()
-        # If user didn't include an extension, keep the old one
-        if os.path.splitext(new_name)[1] == "":
-            new_name = new_name + old_ext
-        new_path = os.path.join(dirpath, new_name)
+        new_input = new_input.strip()
+
+        # If user included an extension in the input, respect it; otherwise keep old_ext
+        new_root, new_ext = os.path.splitext(new_input)
+        if new_ext == "":
+            new_ext = old_ext
+
+        new_root = sanitize_filename_part(new_root)
+
+        # Construct final basename: new_root + _coords (if existed) + ext
+        if coords:
+            final_basename = f"{new_root}_{coords}{new_ext}"
+        else:
+            final_basename = f"{new_root}{new_ext}"
+
+        new_path = os.path.join(dirpath, final_basename)
         if os.path.exists(new_path):
             reply = QMessageBox.question(
                 self,
                 "File đã tồn tại",
-                f"File \"{new_name}\" đã tồn tại. Ghi đè?",
+                f"File \"{final_basename}\" đã tồn tại. Ghi đè?",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
                 return
+
         try:
             os.rename(file_path, new_path)
         except OSError as e:
             QMessageBox.warning(self, "Đổi tên", f"Không thể đổi tên file:\n{e}")
             return
+
         # update stored order: replace old basename with new one at same index
         old_basename = os.path.basename(file_path)
         new_basename = os.path.basename(new_path)
@@ -554,6 +683,47 @@ class MainWindow(QWidget):
             self.gallery_files.append(new_basename)
 
         self.refresh_images_gallery()
+
+    def on_test_image(self, file_path, button):
+        if not os.path.isfile(file_path):
+            QMessageBox.warning(self, "Test", "File ảnh không tồn tại.")
+            return
+
+        button.setEnabled(False)
+        original_text = button.text()
+        button.setText("...")
+
+        self._begin_test()
+        # Đợi 1 chút để cửa sổ ẩn hoàn tất rồi mới thực sự chạy click_image
+        QTimer.singleShot(
+            150, lambda: self._start_test_image_thread(file_path, button, original_text)
+        )
+
+    def _start_test_image_thread(self, file_path, button, original_text):
+        thread = ClickTestThread(file_path)
+        self.gallery_test_threads.append(thread)
+
+        def on_finished(success, error, btn=button, orig=original_text, th=thread):
+            self._end_test()
+
+            btn.setEnabled(True)
+            btn.setText(orig)
+            if th in self.gallery_test_threads:
+                self.gallery_test_threads.remove(th)
+
+            if error:
+                QMessageBox.warning(self, "Test", f"Lỗi khi test click:\n{error}")
+            elif success:
+                QMessageBox.information(self, "Test", "Đã click thành công vào ảnh trên màn hình.")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Test",
+                    "Không tìm thấy ảnh trên màn hình trong thời gian chờ (timeout).",
+                )
+
+        thread.finished_signal.connect(on_finished)
+        thread.start()
 
     def display_capture_thumbnail(self, pixmap):
         # Hiện ảnh thu nhỏ ngay trong ô bên dưới nút "Chọn vùng chụp"
@@ -602,6 +772,56 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "Copy", "Chưa có ảnh nào được lưu.")
             return
         QApplication.clipboard().setText(self.captured_image_path)
+
+    def _begin_test(self):
+        # Ẩn cửa sổ khi bắt đầu test (chỉ ẩn ở lượt test đầu tiên nếu có nhiều test chạy song song)
+        self.active_test_count += 1
+        if self.active_test_count == 1:
+            self.hide()
+
+    def _end_test(self):
+        # Hiện lại cửa sổ khi test cuối cùng đang chạy đã xong
+        self.active_test_count = max(0, self.active_test_count - 1)
+        if self.active_test_count == 0:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def on_test_capture(self):
+        if not self.captured_image_path or not os.path.isfile(self.captured_image_path):
+            QMessageBox.information(self, "Test", "Chưa có ảnh nào được lưu để test.")
+            return
+
+        self.btn_test_capture.setEnabled(False)
+        self.btn_test_capture.setText("Đang test...")
+
+        self._begin_test()
+        # Đợi 1 chút để cửa sổ ẩn hoàn tất rồi mới thực sự chạy click_image
+        QTimer.singleShot(
+            150, lambda: self._start_test_capture_thread(self.captured_image_path)
+        )
+
+    def _start_test_capture_thread(self, image_path):
+        self.test_thread = ClickTestThread(image_path)
+        self.test_thread.finished_signal.connect(self.on_test_finished)
+        self.test_thread.start()
+
+    def on_test_finished(self, success, error):
+        self._end_test()
+
+        self.btn_test_capture.setEnabled(True)
+        self.btn_test_capture.setText("Test")
+
+        if error:
+            QMessageBox.warning(self, "Test", f"Lỗi khi test click:\n{error}")
+        elif success:
+            QMessageBox.information(self, "Test", "Đã click thành công vào ảnh trên màn hình.")
+        else:
+            QMessageBox.warning(
+                self,
+                "Test",
+                "Không tìm thấy ảnh trên màn hình trong thời gian chờ (timeout).",
+            )
 
     def on_copy_mouse(self):
         if self.mouse_position is None:
