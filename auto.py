@@ -293,26 +293,36 @@ def random_time(date, start_str, end_str):
 
     return start + timedelta(seconds=seconds)
 
-
 def load_config():
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def print_next_day_schedule(config, date):
+def print_day_schedule(config, date):
     weekday = str(date.weekday())
     day_cfg = config.get("schedule", {}).get(weekday, {})
 
-    print(f"\n===== Lịch {WEEKDAY_NAME[date.weekday()]} ({date:%d/%m/%Y}) =====")
+    print(f"\n===== {WEEKDAY_NAME[date.weekday()]} ({date:%d/%m/%Y}) =====")
 
     if not day_cfg:
-        print(f"{WEEKDAY_NAME[date.weekday()]} không có lịch.")
-        return
+        print("Không có lịch.")
+        return False
 
     for job_name, cfg in day_cfg.items():
         print(
-            f"- {job_name}: "
-            f"{cfg.get('start')} -> {cfg.get('end')}"
+            f"- {job_name}: {cfg['start']} -> {cfg['end']}"
         )
+
+    return True
+
+def print_next_schedule(config, from_date):
+    print("\n===== LỊCH TIẾP THEO =====")
+
+    for i in range(1, 8):
+        d = from_date + timedelta(days=i)
+        if print_day_schedule(config, d):
+            return
+
+    print("7 ngày tới không có lịch.")
 
 def scheduler():
 
@@ -404,6 +414,12 @@ def scheduler():
                 print(f"Lỗi {job_name}: {e}")
 
         # Chờ sang ngày mới
+        today = datetime.now().date()
+
+        print(f"\nĐã hoàn thành lịch {WEEKDAY_NAME[today.weekday()]} ({today:%d/%m/%Y})")
+
+        print_next_schedule(config, today)
+
         tomorrow = (datetime.now() + timedelta(days=1)).replace(
             hour=0,
             minute=0,
@@ -411,13 +427,10 @@ def scheduler():
             microsecond=0
         )
 
-        print(f"\nĐã hoàn thành lịch {WEEKDAY_NAME[datetime.now().weekday()]}.")
-        print_next_day_schedule(config, tomorrow.date())
-
         sleep_time = (tomorrow - datetime.now()).total_seconds()
 
         print(
-            f"Chờ {int(sleep_time)} giây đến "
+            f"\nScheduler ngủ {int(sleep_time)} giây đến "
             f"{tomorrow:%d/%m/%Y %H:%M:%S}\n"
         )
 
