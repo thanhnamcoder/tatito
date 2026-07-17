@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import subprocess
 import pyperclip
@@ -137,42 +136,6 @@ def wait_image(
 # CLICK ẢNH
 # ==========================
 
-# ==========================
-# TRÍCH XUẤT REGION TỪ TÊN FILE
-# ==========================
-
-def get_region_from_filename(image_path):
-    """
-    Trích xuất vùng tìm kiếm (x, y, w, h) từ tên file ảnh có định dạng
-    "x_y_w_h.<ext>" (đây là định dạng tên file tự động do tool.py đặt khi
-    lưu ảnh chụp vùng, xem hàm save_captured_image trong tool.py).
-
-    Nếu tên file không đúng định dạng này (hoặc w/h không hợp lệ),
-    trả về None -> click_image sẽ tìm trên toàn màn hình.
-    """
-    basename = os.path.basename(image_path)
-    name, _ext = os.path.splitext(basename)
-
-    # Expect filename to end with "_<x>_<y>_<w>_<h>" where x,y can be negative
-    # Example: "capture_20260717_120101_100_200_300_150.png" -> coords (100,200,300,150)
-    m = re.search(r"_(-?\d+)_(-?\d+)_(\d+)_(\d+)$", name)
-    if not m:
-        return None
-
-    try:
-        x = int(m.group(1))
-        y = int(m.group(2))
-        w = int(m.group(3))
-        h = int(m.group(4))
-    except Exception:
-        return None
-
-    if w <= 0 or h <= 0:
-        return None
-
-    return (x, y, w, h)
-
-
 def click_image(
     image_path,
     confidence=0.8,
@@ -181,17 +144,6 @@ def click_image(
     region=None,
     stable_count=3
 ):
-    # Nếu không truyền region, thử tự trích xuất từ tên file ảnh
-    # (tên file có đuôi "_<x>_<y>_<w>_<h>.png"). Nếu tìm thấy, sử dụng region này
-    # để giới hạn vùng tìm kiếm
-    if region is None:
-        extracted = get_region_from_filename(image_path)
-        if extracted:
-            region = extracted
-            log(f"Tự động lấy region từ tên file: {region}")
-        else:
-            region = None
-
     last_pos = None
     stable = 0
     start = time.time()
@@ -357,7 +309,6 @@ def scheduler():
         # Tạo danh sách các job hôm nay
         for job_name, cfg in day_cfg.items():
 
-
             start = cfg.get("start")
             end = cfg.get("end")
 
@@ -476,3 +427,4 @@ def test1():
     open_app(r"C:\Program Files\CocCoc\Browser\Application\browser.exe")
 def test2():
     close_app(r"C:\Program Files\CocCoc\Browser\Application\browser.exe")
+
