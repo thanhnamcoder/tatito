@@ -1,9 +1,11 @@
 import sys
 import os
+import time
 import json
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication,
+    QStatusBar,
     QWidget,
     QFrame,
     QPushButton,
@@ -23,32 +25,53 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QFormLayout,
     QTimeEdit,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QSplitter,
+    QGroupBox,
+    QSpinBox,
+    QDoubleSpinBox,
+    QAbstractItemView,
+    QFileDialog
 )
 from PyQt5.QtCore import Qt, QPoint, QRect, QSize, QTimer, QThread, pyqtSignal, QTime
 from PyQt5.QtGui import QPainter, QColor, QKeySequence, QPixmap, QIntValidator
-from auto import click_image as auto_click_image, trigger_scheduler_reload, Job
+from auto import click_image as auto_click_image, trigger_scheduler_reload, check_scheduler_status
 import re
 import unicodedata
 import inspect
 
 
-def get_job_function_names():
+def get_job_function_names(config_path=None):
     """
-    Lấy danh sách tên các hàm (method) công khai được định nghĩa trong
-    class Job (auto.py). Đây là các tên job hợp lệ có thể gán vào lịch,
-    vì scheduler() sẽ tìm hàm cùng tên để chạy.
+    Lấy danh sách tên job từ file config.json (từ các mục trong schedule).
+    Đây là nguồn dữ liệu chính cho giao diện và scheduler.
     """
+    if config_path is None:
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+    if not os.path.exists(config_path):
+        return []
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return []
+
     names = []
-    for name, member in inspect.getmembers(Job, predicate=inspect.isfunction):
-        if name.startswith("_"):
+    schedule = config.get("schedule", {})
+    for day_cfg in schedule.values():
+        if not isinstance(day_cfg, dict):
             continue
-        names.append(name)
+        for job_name in day_cfg.keys():
+            if job_name not in names:
+                names.append(job_name)
     return sorted(names)
 
 
@@ -132,6 +155,31 @@ def sanitize_filename_part(name):
     return text or "file"
 
 
+def normalize_app_path(path_value):
+    if path_value is None:
+        return ""
+
+    path_text = str(path_value).strip()
+    if not path_text:
+        return ""
+
+    path_text = path_text.strip('"').strip("'")
+
+    if os.path.isabs(path_text):
+        return path_text
+
+    if os.path.exists(path_text):
+        return os.path.abspath(path_text)
+
+    if os.path.exists(os.path.abspath(path_text)):
+        return os.path.abspath(path_text)
+
+    # Nếu người dùng nhập dạng như C:\Program Files\... thì giữ nguyên,
+    # còn nếu nhập dạng có dấu \ thay bằng / thì chuẩn hóa lại.
+    normalized = path_text.replace("/", os.sep).replace("\\", os.sep)
+    return normalized
+
+
 class SelectionOverlay(QWidget):
     """
     Cửa sổ overlay toàn màn hình, nền mờ, cho phép người dùng kéo chuột
@@ -200,68 +248,7 @@ class SelectionOverlay(QWidget):
             self.on_finished(None)
 
 
-class PositionPickerOverlay(QWidget):
-    """
-    Cửa sổ overlay toàn màn hình, nền mờ, chờ người dùng click 1 lần.
-    Click vào đâu sẽ lấy tọa độ chuột (tính theo tọa độ toàn màn hình) tại đó
-    rồi gọi callback với QPoint đã click. Nhấn ESC để hủy (callback nhận None).
-    """
 
-    def __init__(self, on_finished):
-        super().__init__()
-        self.on_finished = on_finished
-
-        self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setCursor(Qt.CrossCursor)
-
-        desktop = QApplication.desktop()
-        full_geometry = QRect()
-        for i in range(desktop.screenCount()):
-            full_geometry = full_geometry.united(desktop.screenGeometry(i))
-        self.setGeometry(full_geometry)
-
-        self.esc_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
-        self.esc_shortcut.activated.connect(self.cancel_pick)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 90))
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            # globalPos vẫn đúng khi overlay phủ nhiều màn hình
-            global_pos = event.globalPos()
-            self.close()
-            if self.on_finished:
-                self.on_finished(global_pos)
-
-    def cancel_pick(self):
-        self.close()
-        if self.on_finished:
-            self.on_finished(None)
-
-
-class ClickTestThread(QThread):
-    """
-    Chạy auto_click_image() ở luồng riêng để không làm treo giao diện
-    (vì click_image có thể chờ/lặp trong nhiều giây).
-    """
-
-    finished_signal = pyqtSignal(bool, str)
-
-    def __init__(self, image_path):
-        super().__init__()
-        self.image_path = image_path
-
-    def run(self):
-        try:
-            result = auto_click_image(self.image_path, timeout=5)
-            self.finished_signal.emit(bool(result), "")
-        except Exception as e:
-            self.finished_signal.emit(False, str(e))
 
 
 class ElidedLabel(QLabel):
@@ -287,658 +274,891 @@ class ElidedLabel(QLabel):
         super().setText(elided)
 
 
-class TimePickerWidget(QWidget):
-    """
-    Chọn giờ:phút bằng 2 dropdown (Giờ 00-23, Phút 00-59). So với QTimeEdit
-    (phải bấm mũi tên tăng/giảm nhiều lần), cách này cho phép:
-    - Click mở danh sách rồi chọn thẳng giá trị cần, hoặc
-    - Gõ số để nhảy nhanh tới giờ/phút mong muốn.
-    Vẫn giữ được độ chính xác tới từng phút (không giới hạn theo mốc 5/15 phút).
-    """
 
-    changed = pyqtSignal()
 
-    def __init__(self, parent=None):
+class ImageFileRow(QFrame):
+    clicked = pyqtSignal(str)
+    double_clicked = pyqtSignal(str)
+    delete_clicked = pyqtSignal(str)
+
+    def __init__(self, file_path, parent=None):
         super().__init__(parent)
+        self.file_path = file_path
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(file_path)
+        self._selected = False
+
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
 
-        self.hour_combo = QComboBox(self)
-        self.hour_combo.setEditable(True)
-        self.hour_combo.setInsertPolicy(QComboBox.NoInsert)
-        self.hour_combo.addItems([f"{h:02d}" for h in range(24)])
-        self.hour_combo.setValidator(QIntValidator(0, 23, self.hour_combo))
-        self.hour_combo.setFixedWidth(52)
-        self.hour_combo.setMaxVisibleItems(12)
+        pixmap = QPixmap(file_path)
+        if not pixmap.isNull():
+            thumb = pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            img_label = QLabel()
+            img_label.setPixmap(thumb)
+            img_label.setFixedSize(48, 48)
+            layout.addWidget(img_label)
 
-        colon_label = QLabel(":")
-        colon_label.setFixedWidth(8)
-        colon_label.setAlignment(Qt.AlignCenter)
+        name_label = ElidedLabel(os.path.basename(file_path))
+        name_label.setFullText(os.path.basename(file_path))
+        name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        name_label.setToolTip(file_path)
+        layout.addWidget(name_label, 1)
 
-        self.minute_combo = QComboBox(self)
-        self.minute_combo.setEditable(True)
-        self.minute_combo.setInsertPolicy(QComboBox.NoInsert)
-        self.minute_combo.addItems([f"{m:02d}" for m in range(60)])
-        self.minute_combo.setValidator(QIntValidator(0, 59, self.minute_combo))
-        self.minute_combo.setFixedWidth(52)
-        self.minute_combo.setMaxVisibleItems(12)
+        delete_btn = QPushButton("Delete")
+        delete_btn.setFixedWidth(70)
+        delete_btn.clicked.connect(lambda checked=False: self.delete_clicked.emit(self.file_path))
+        layout.addWidget(delete_btn)
 
-        layout.addWidget(self.hour_combo)
-        layout.addWidget(colon_label)
-        layout.addWidget(self.minute_combo)
+    def set_selected(self, selected):
+        self._selected = bool(selected)
+        if self._selected:
+            self.setStyleSheet("background: #e8f1ff; border: 1px solid #8fb6ff;")
+        else:
+            self.setStyleSheet("")
 
-        self.now_btn = QPushButton("Now", self)
-        self.now_btn.setToolTip("Chọn giờ:phút hiện tại")
-        self.now_btn.setFixedWidth(40)
-        self.now_btn.clicked.connect(self.set_to_now)
-        layout.addWidget(self.now_btn)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.file_path)
+        super().mousePressEvent(event)
 
-        layout.addStretch(1)
-
-        self.hour_combo.currentIndexChanged.connect(self.changed.emit)
-        self.minute_combo.currentIndexChanged.connect(self.changed.emit)
-
-    def _set_combo_value(self, combo, value):
-        combo.blockSignals(True)
-        try:
-            idx = combo.findText(value)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-            else:
-                combo.setEditText(value)
-        finally:
-            combo.blockSignals(False)
-
-    def set_to_now(self):
-        now = QTime.currentTime()
-        self._set_combo_value(self.hour_combo, f"{now.hour():02d}")
-        self._set_combo_value(self.minute_combo, f"{now.minute():02d}")
-        self.changed.emit()
-
-    def set_time_str(self, text):
-        t = QTime.fromString(text, "HH:mm") if text else QTime()
-        if not t.isValid():
-            t = QTime(8, 0)
-        self._set_combo_value(self.hour_combo, f"{t.hour():02d}")
-        self._set_combo_value(self.minute_combo, f"{t.minute():02d}")
-
-    def time_str(self):
-        try:
-            hour = int(self.hour_combo.currentText())
-        except ValueError:
-            hour = 0
-        try:
-            minute = int(self.minute_combo.currentText())
-        except ValueError:
-            minute = 0
-        hour = max(0, min(23, hour))
-        minute = max(0, min(59, minute))
-        return f"{hour:02d}:{minute:02d}"
+    def mouseDoubleClickEvent(self, event):
+        self.double_clicked.emit(self.file_path)
+        super().mouseDoubleClickEvent(event)
 
 
-class DayScheduleWidget(QWidget):
-    """
-    Widget hiển thị và chỉnh sửa danh sách job cho MỘT ngày cụ thể, dưới dạng
-    bảng (tên job / giờ bắt đầu / giờ kết thúc / nút xóa) để dễ nhìn và sửa
-    trực tiếp, thay vì phải chọn từng job trong danh sách rồi gõ lại form.
-    """
-
-    COL_NAME = 0
-    COL_START = 1
-    COL_END = 2
-    COL_ACTION = 3
-
-    def __init__(self, day_key, job_names=None, on_change=None, parent=None):
+class JobListRow(QWidget):
+    def __init__(self, job_name, on_test=None, on_delete=None, parent=None):
         super().__init__(parent)
-        self.day_key = day_key
-        self.on_change = on_change
-        self.job_names = job_names or []
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 8, 0, 0)
+        self.job_name = job_name
+        self.on_test = on_test
+        self.on_delete = on_delete
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(8)
 
-        self.table = QTableWidget(0, 4, self)
-        self.table.setHorizontalHeaderLabels(
-            ["Tên job", "Bắt đầu", "Kết thúc", ""]
-        )
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(
-            QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed
-        )
+        label = QLabel(job_name)
+        label.setWordWrap(False)
+        layout.addWidget(label, 1)
 
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(self.COL_NAME, QHeaderView.Stretch)
-        header.setSectionResizeMode(self.COL_START, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(self.COL_END, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(self.COL_ACTION, QHeaderView.ResizeToContents)
+        test_btn = QPushButton("Test")
+        test_btn.setFixedWidth(60)
+        if on_test:
+            test_btn.clicked.connect(lambda: on_test(job_name))
+        layout.addWidget(test_btn)
 
-        layout.addWidget(self.table, 1)
-
-        btn_row = QHBoxLayout()
-        add_btn = QPushButton("+ Thêm job")
-        add_btn.clicked.connect(self.on_add_clicked)
-        btn_row.addWidget(add_btn)
-        btn_row.addStretch(1)
-        layout.addLayout(btn_row)
-
-    def _notify_change(self):
-        if self.on_change:
-            self.on_change()
-
-    def on_add_clicked(self):
-        if not self.job_names:
-            QMessageBox.warning(
-                self,
-                "Thêm job",
-                "Không tìm thấy hàm nào trong class Job (auto.py) để chọn.\n"
-                "Hãy thêm method vào class Job rồi thử lại.",
-            )
-            return
-        self.add_row()
-
-    def add_row(self, name="", start="08:00", end="09:00"):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-
-        name_combo = QComboBox(self.table)
-        name_combo.setEditable(False)
-        if self.job_names:
-            name_combo.addItems(self.job_names)
-        else:
-            name_combo.addItem("(Không có hàm nào trong class Job)")
-            name_combo.setEnabled(False)
-
-        if name:
-            idx = name_combo.findText(name)
-            if idx >= 0:
-                name_combo.setCurrentIndex(idx)
-            else:
-                # Tên job đã lưu trước đó không còn khớp hàm nào trong class Job
-                # hiện tại -> vẫn thêm vào combobox để không làm mất dữ liệu cũ.
-                name_combo.addItem(name)
-                name_combo.setCurrentIndex(name_combo.count() - 1)
-        elif self.job_names:
-            name_combo.setCurrentIndex(0)
-
-        name_combo.currentIndexChanged.connect(self._notify_change)
-        self.table.setCellWidget(row, self.COL_NAME, name_combo)
-
-        start_widget = TimePickerWidget(self.table)
-        start_widget.set_time_str(start)
-        start_widget.changed.connect(self._notify_change)
-        self.table.setCellWidget(row, self.COL_START, start_widget)
-
-        end_widget = TimePickerWidget(self.table)
-        end_widget.set_time_str(end)
-        end_widget.changed.connect(self._notify_change)
-        self.table.setCellWidget(row, self.COL_END, end_widget)
-
-        remove_btn = QPushButton("Xóa")
-        remove_btn.setFixedWidth(60)
-        remove_btn.clicked.connect(
-            lambda checked=False, btn=remove_btn: self.remove_row_by_widget(btn)
-        )
-        self.table.setCellWidget(row, self.COL_ACTION, remove_btn)
-
-        self.table.scrollToBottom()
-        self._notify_change()
-        return row
-
-    def remove_row_by_widget(self, widget):
-        for row in range(self.table.rowCount()):
-            if self.table.cellWidget(row, self.COL_ACTION) is widget:
-                self.table.removeRow(row)
-                break
-        self._notify_change()
-
-    def clear_rows(self):
-        self.table.setRowCount(0)
-
-    def load_jobs(self, day_cfg):
-        self.clear_rows()
-        for job_name in sorted(day_cfg.keys()):
-            cfg = day_cfg[job_name]
-            self.add_row(job_name, cfg.get("start", "08:00"), cfg.get("end", "09:00"))
-        self._notify_change()
-
-    def collect_jobs(self):
-        """
-        Trả về (dict_jobs, list_loi).
-        Các dòng chưa đặt tên sẽ được bỏ qua (không tính là lỗi).
-        Tên job trùng nhau trong cùng 1 ngày sẽ được báo lỗi.
-        """
-        jobs = {}
-        errors = []
-        for row in range(self.table.rowCount()):
-            name_combo = self.table.cellWidget(row, self.COL_NAME)
-            name = name_combo.currentText().strip() if name_combo and name_combo.isEnabled() else ""
-            if not name:
-                continue
-
-            start_widget = self.table.cellWidget(row, self.COL_START)
-            end_widget = self.table.cellWidget(row, self.COL_END)
-            start = start_widget.time_str() if start_widget else "00:00"
-            end = end_widget.time_str() if end_widget else "00:00"
-
-            if name in jobs:
-                errors.append(f"Tên job \"{name}\" bị trùng lặp.")
-                continue
-
-            jobs[name] = {"start": start, "end": end}
-        return jobs, errors
-
-    def job_count(self):
-        count = 0
-        for row in range(self.table.rowCount()):
-            name_combo = self.table.cellWidget(row, self.COL_NAME)
-            if name_combo and name_combo.isEnabled() and name_combo.currentText().strip():
-                count += 1
-        return count
+        delete_btn = QPushButton("Delete")
+        delete_btn.setFixedWidth(60)
+        if on_delete:
+            delete_btn.clicked.connect(lambda: on_delete(job_name))
+        layout.addWidget(delete_btn)
 
 
-class ConfigEditorDialog(QDialog):
-    """
-    Giao diện chỉnh cấu hình lịch, được thiết kế lại để dễ dùng hơn:
-    - Mỗi ngày trong tuần là 1 tab riêng (thay vì phải chọn ngày trong combobox
-      rồi mới thấy job của ngày đó), số job trong ngày hiển thị ngay trên tab.
-    - Job của từng ngày hiển thị dạng bảng, sửa tên/giờ trực tiếp trên bảng,
-      không cần chọn job rồi gõ lại vào form riêng.
-    - Có thể sao chép nhanh lịch từ 1 ngày sang ngày đang mở (rất hữu ích khi
-      nhiều ngày có lịch giống nhau).
-    """
-
-    def __init__(self, parent, config_path):
+class WorkflowListWidget(QListWidget):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.config_path = config_path
-        self.setWindowTitle("Cấu hình lịch")
-        self.resize(860, 580)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
 
-        self.schedule_data = load_config_file(config_path)
-        if not isinstance(self.schedule_data, dict):
-            self.schedule_data = build_default_schedule()
-        if "schedule" not in self.schedule_data or not isinstance(self.schedule_data["schedule"], dict):
-            self.schedule_data["schedule"] = {}
-
-        layout = QVBoxLayout(self)
-
-        self.job_names = get_job_function_names()
-
-        info_label = QLabel(
-            "Mỗi tab bên dưới là 1 ngày trong tuần. Nhấn \"+ Thêm job\" để thêm job mới, "
-            "chọn tên job trong danh sách các hàm có sẵn trong class Job (auto.py), "
-            "chọn giờ trực tiếp bằng ô giờ, và nhấn \"Xóa\" ở cuối dòng để xóa job."
-        )
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("padding: 6px; background: #f5f5f5; border-radius: 4px;")
-        layout.addWidget(info_label)
-
-        # --- Khu vực sao chép lịch giữa các ngày ---
-        copy_row = QHBoxLayout()
-        copy_row.addWidget(QLabel("Sao chép lịch từ:"))
-        self.copy_source_combo = QComboBox(self)
-        for label, value in WEEKDAY_OPTIONS:
-            self.copy_source_combo.addItem(label, value)
-        copy_row.addWidget(self.copy_source_combo)
-
-        copy_row.addWidget(QLabel("→ sang tab đang mở (sẽ thay thế lịch hiện tại)"))
-        copy_btn = QPushButton("Sao chép")
-        copy_btn.clicked.connect(self.on_copy_from_day)
-        copy_row.addWidget(copy_btn)
-        copy_row.addStretch(1)
-        layout.addLayout(copy_row)
-
-        # --- Tabs cho từng ngày ---
-        self.tabs = QTabWidget(self)
-        self.day_widgets = {}
-        for label, day_key in WEEKDAY_OPTIONS:
-            day_widget = DayScheduleWidget(
-                day_key,
-                job_names=self.job_names,
-                on_change=self.update_tab_titles,
-                parent=self,
-            )
-            day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(day_key, {})
-            day_widget.load_jobs(day_cfg)
-            self.day_widgets[day_key] = day_widget
-            self.tabs.addTab(day_widget, label)
-
-        self.update_tab_titles()
-        layout.addWidget(self.tabs, 1)
-
-        button_row = QHBoxLayout()
-        button_row.addStretch(1)
-        save_btn = QPushButton("Lưu")
-        save_btn.setDefault(True)
-        save_btn.clicked.connect(self.on_save)
-        cancel_btn = QPushButton("Hủy")
-        cancel_btn.clicked.connect(self.reject)
-        button_row.addWidget(save_btn)
-        button_row.addWidget(cancel_btn)
-        layout.addLayout(button_row)
-
-    def update_tab_titles(self):
-        for index, (label, day_key) in enumerate(WEEKDAY_OPTIONS):
-            widget = self.day_widgets.get(day_key)
-            count = widget.job_count() if widget else 0
-            suffix = f" ({count})" if count else ""
-            self.tabs.setTabText(index, f"{label}{suffix}")
-
-    def on_copy_from_day(self):
-        source_key = self.copy_source_combo.currentData()
-        target_index = self.tabs.currentIndex()
-        target_label, target_key = WEEKDAY_OPTIONS[target_index]
-
-        if source_key == target_key:
-            QMessageBox.information(
-                self, "Sao chép", "Ngày nguồn và ngày đích đang trùng nhau."
-            )
-            return
-
-        target_widget = self.day_widgets[target_key]
-        if target_widget.job_count() > 0:
-            reply = QMessageBox.question(
-                self,
-                "Sao chép lịch",
-                f"Tab \"{target_label}\" đang có job. Sao chép sẽ THAY THẾ toàn bộ "
-                f"job hiện tại của tab này. Bạn có chắc muốn tiếp tục?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        source_widget = self.day_widgets[source_key]
-        source_jobs, _ = source_widget.collect_jobs()
-        target_widget.load_jobs(source_jobs)
-        self.update_tab_titles()
-
-    def on_save(self):
-        new_schedule = {}
-        all_errors = []
-        for label, day_key in WEEKDAY_OPTIONS:
-            jobs, errors = self.day_widgets[day_key].collect_jobs()
-            new_schedule[day_key] = jobs
-            for err in errors:
-                all_errors.append(f"[{label}] {err}")
-
-        if all_errors:
-            QMessageBox.warning(
-                self,
-                "Cấu hình",
-                "Vui lòng sửa các lỗi sau trước khi lưu:\n\n" + "\n".join(all_errors),
-            )
-            return
-
-        self.schedule_data["schedule"] = new_schedule
-
-        try:
-            save_config_file(self.config_path, self.schedule_data)
-            trigger_scheduler_reload()
-        except Exception as e:
-            QMessageBox.warning(self, "Cấu hình", f"Không thể lưu file:\n{e}")
-            return
-
-        QMessageBox.information(self, "Cấu hình", "Đã lưu cấu hình thành công.")
-        self.accept()
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        if hasattr(self.parent(), "reorder_workflow_steps"):
+            self.parent().reorder_workflow_steps()
 
 
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("App")
-        self.setMinimumSize(700, 400)
-        self.overlay = None
-        self.selected_rect = None
-        self.captured_rect = None
-        self.captured_pixmap = None
-        self.captured_image_path = None
-        self.mouse_position = None
-        self.gallery_files = []  # keep current display order of filenames
-        self.gallery_test_threads = []  # giữ tham chiếu các thread Test trong gallery
-        self.active_test_count = 0  # đếm số lượt test đang chạy để ẩn/hiện cửa sổ đúng lúc
-        self.config_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+class SetJobDialog(QDialog):
+    ACTIONS = [
+        ("Open App", "open_app"),
+        ("Close App", "close_app"),
+        ("Click Image", "click_image"),
+        ("Wait Image", "wait_image"),
+        ("Type Text", "paste"),
+        ("Sleep", "sleep"),
+    ]
+
+    def __init__(self, parent=None, config_path=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set Job")
+        self.resize(1100, 650)
+        self.config_path = config_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        self.selected_action = "Click Image"
+        self.selected_action_key = self.get_action_key(self.selected_action)
+        self.selected_day_key = "0"
+        self.selected_job_name = ""
+        self.selected_job_config = None
+        self.selected_image_path = ""
+        self.job_names = get_job_function_names(self.config_path)
+        self.workflow_steps = []
+        self.workflow_data = []
         self.init_ui()
+        self.scheduler_status_timer = QTimer(self)
+        self.scheduler_status_timer.timeout.connect(self.refresh_scheduler_status)
+        self.scheduler_status_timer.start(3000)
+        self.refresh_scheduler_status()
+        self.refresh_job_list()
+        self.create_new_job()
+
+    def get_action_key(self, label):
+        for name, key in self.ACTIONS:
+            if name == label:
+                return key
+        return ""
+
+    def refresh_scheduler_status(self):
+        status = check_scheduler_status()
+        if status.get("running"):
+            self.scheduler_status_label.setText(f"Scheduler: Đang chạy (PID {status.get('pid')})")
+            self.scheduler_status_label.setStyleSheet("font-weight: bold; color: #2e7d32;")
+        else:
+            self.scheduler_status_label.setText("Scheduler: Dừng")
+            self.scheduler_status_label.setStyleSheet("font-weight: bold; color: #c62828;")
 
     def init_ui(self):
-        self.central_widget = QWidget(self)
-        self.setCentralWidget(self.central_widget)
-        self.create_toolbar()
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(10)
 
-        main_layout = QVBoxLayout(self.central_widget)
+        header = QLabel("Automation Workflow")
+        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        main_layout.addWidget(header)
 
-        # Left frame with buttons
-        left_frame = QFrame(self)
-        left_frame.setFrameShape(QFrame.StyledPanel)
-        left_frame.setMinimumWidth(240)
-        left_layout = QVBoxLayout(left_frame)
-        left_layout.setContentsMargins(20, 20, 20, 20)
-        left_layout.setSpacing(15)
+        self.scheduler_status_label = QLabel("Scheduler: kiểm tra...")
+        self.scheduler_status_label.setStyleSheet("font-weight: bold; color: #555;")
+        main_layout.addWidget(self.scheduler_status_label)
 
-        label = QLabel("Chức năng")
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("font-size: 18px; font-weight: bold;")
-        left_layout.addWidget(label)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Tìm action...")
+        self.search_edit.textChanged.connect(self.filter_toolbox)
+        main_layout.addWidget(self.search_edit)
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(10)
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter, 1)
 
-        button_width = 130
+        toolbox_panel = QFrame()
+        toolbox_panel.setFrameShape(QFrame.StyledPanel)
+        toolbox_layout = QVBoxLayout(toolbox_panel)
+        toolbox_layout.setContentsMargins(8, 8, 8, 8)
+        toolbox_layout.setSpacing(8)
 
-        # --- Nút "Chọn vùng" + ô hiển thị kết quả bên dưới ---
-        self.btn_select_area = QPushButton("Chọn vùng")
-        self.btn_select_area.setFixedWidth(button_width)
-        self.btn_select_area.clicked.connect(self.on_select_area)
-        select_layout = QVBoxLayout()
-        select_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-        select_layout.addWidget(self.btn_select_area, alignment=Qt.AlignHCenter)
+        toolbox_label = QLabel("Toolbox")
+        toolbox_label.setStyleSheet("font-weight: bold;")
+        toolbox_layout.addWidget(toolbox_label)
 
-        self.select_result_label = QLabel("Chưa chọn")
-        self.select_result_label.setAlignment(Qt.AlignCenter)
-        self.select_result_label.setWordWrap(True)
-        self.select_result_label.setFrameShape(QFrame.Box)
-        self.select_result_label.setFixedSize(button_width, 80)
-        self.select_result_label.setStyleSheet("padding: 4px; font-size: 11px;")
-        select_layout.addWidget(self.select_result_label, alignment=Qt.AlignHCenter)
+        self.toolbox_list = QListWidget()
+        self.toolbox_list.setFixedWidth(180)
+        self.toolbox_list.addItems([name for name, _ in self.ACTIONS])
+        self.toolbox_list.setCurrentRow(0)
+        self.toolbox_list.currentItemChanged.connect(self.on_toolbox_selection_changed)
+        toolbox_layout.addWidget(self.toolbox_list, 1)
 
-        self.btn_copy_select = QPushButton("Copy")
-        self.btn_copy_select.setFixedWidth(button_width)
-        self.btn_copy_select.clicked.connect(self.on_copy_select)
-        select_layout.addWidget(self.btn_copy_select, alignment=Qt.AlignHCenter)
-        button_row.addLayout(select_layout)
+        workflow_panel = QFrame()
+        workflow_panel.setFrameShape(QFrame.StyledPanel)
+        workflow_layout = QVBoxLayout(workflow_panel)
+        workflow_layout.setContentsMargins(8, 8, 8, 8)
+        workflow_layout.setSpacing(8)
 
-        self.btn_capture_area = QPushButton("Chọn vùng chụp")
-        self.btn_capture_area.setFixedWidth(button_width)
-        self.btn_capture_area.clicked.connect(self.on_capture_area)
-        capture_layout = QVBoxLayout()
-        capture_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-        capture_layout.addWidget(self.btn_capture_area, alignment=Qt.AlignHCenter)
+        workflow_label = QLabel("Workflow")
+        workflow_label.setStyleSheet("font-weight: bold;")
+        workflow_layout.addWidget(workflow_label)
 
-        self.capture_result_label = QLabel("Chưa chụp")
-        self.capture_result_label.setAlignment(Qt.AlignCenter)
-        self.capture_result_label.setWordWrap(True)
-        self.capture_result_label.setFrameShape(QFrame.Box)
-        self.capture_result_label.setFixedSize(button_width, 80)
-        self.capture_result_label.setStyleSheet("padding: 4px; font-size: 11px;")
-        capture_layout.addWidget(self.capture_result_label, alignment=Qt.AlignHCenter)
+        self.workflow_list = WorkflowListWidget(self)
+        self.workflow_list.currentItemChanged.connect(self.on_workflow_selection_changed)
+        workflow_layout.addWidget(self.workflow_list, 1)
 
-        copy_test_row = QHBoxLayout()
-        copy_test_row.setSpacing(6)
+        buttons_layout = QHBoxLayout()
+        add_btn = QPushButton("+ Add Step")
+        add_btn.clicked.connect(self.add_current_step)
+        buttons_layout.addWidget(add_btn)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self.remove_current_step)
+        buttons_layout.addWidget(remove_btn)
+        workflow_layout.addLayout(buttons_layout)
 
-        self.btn_copy_capture = QPushButton("Copy")
-        self.btn_copy_capture.setFixedWidth((button_width - 6) // 2)
-        self.btn_copy_capture.clicked.connect(self.on_copy_capture)
-        copy_test_row.addWidget(self.btn_copy_capture)
+        properties_panel = QFrame()
+        properties_panel.setFrameShape(QFrame.StyledPanel)
+        properties_layout = QVBoxLayout(properties_panel)
+        properties_layout.setContentsMargins(8, 8, 8, 8)
+        properties_layout.setSpacing(8)
 
-        self.btn_test_capture = QPushButton("Test")
-        self.btn_test_capture.setFixedWidth((button_width - 6) // 2)
-        self.btn_test_capture.clicked.connect(self.on_test_capture)
-        copy_test_row.addWidget(self.btn_test_capture)
+        properties_title = QLabel("Properties")
+        properties_title.setStyleSheet("font-weight: bold;")
+        properties_layout.addWidget(properties_title)
 
-        capture_layout.addLayout(copy_test_row)
-        button_row.addLayout(capture_layout)
+        self.action_name_label = QLabel(self.selected_action)
+        self.action_name_label.setStyleSheet("font-size: 13px; color: #2563eb;")
+        properties_layout.addWidget(self.action_name_label)
 
-        self.btn_get_mouse_position = QPushButton("Lấy vị trí chuột")
-        self.btn_get_mouse_position.setFixedWidth(button_width)
-        self.btn_get_mouse_position.clicked.connect(self.on_get_mouse_position)
-        mouse_layout = QVBoxLayout()
-        mouse_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
-        mouse_layout.addWidget(self.btn_get_mouse_position, alignment=Qt.AlignHCenter)
+        self.properties_form = QFormLayout()
+        self.properties_form.setSpacing(8)
 
-        self.mouse_result_label = QLabel("Chưa lấy")
-        self.mouse_result_label.setAlignment(Qt.AlignCenter)
-        self.mouse_result_label.setWordWrap(True)
-        self.mouse_result_label.setFrameShape(QFrame.Box)
-        self.mouse_result_label.setFixedSize(button_width, 80)
-        self.mouse_result_label.setStyleSheet("padding: 4px; font-size: 11px;")
-        mouse_layout.addWidget(self.mouse_result_label, alignment=Qt.AlignHCenter)
+        jobs_title = QLabel("Jobs từ config.json")
+        jobs_title.setStyleSheet("font-weight: bold;")
+        properties_layout.addWidget(jobs_title)
 
-        self.btn_copy_mouse = QPushButton("Copy")
-        self.btn_copy_mouse.setFixedWidth(button_width)
-        self.btn_copy_mouse.clicked.connect(self.on_copy_mouse)
-        mouse_layout.addWidget(self.btn_copy_mouse, alignment=Qt.AlignHCenter)
-        button_row.addLayout(mouse_layout)
+        self.job_list_widget = QListWidget()
+        self.job_list_widget.setFixedHeight(140)
+        self.job_list_widget.itemClicked.connect(self.on_job_list_selected)
+        properties_layout.addWidget(self.job_list_widget)
 
-        left_layout.addLayout(button_row)
-        left_layout.addStretch(1)
+        new_job_row = QHBoxLayout()
+        self.new_job_btn = QPushButton("Tạo job mới")
+        self.new_job_btn.clicked.connect(self.create_new_job)
+        new_job_row.addWidget(self.new_job_btn)
+        new_job_row.addStretch(1)
+        properties_layout.addLayout(new_job_row)
 
-        # Right frame: hiển thị toàn bộ ảnh trong thư mục Images
-        right_frame = QFrame(self)
-        right_frame.setFrameShape(QFrame.StyledPanel)
-        right_frame_layout = QVBoxLayout(right_frame)
-        right_frame_layout.setContentsMargins(15, 15, 15, 15)
-        right_frame_layout.setSpacing(10)
+        self.job_name_edit = QLineEdit("new_job")
+        self.properties_form.addRow("Job Name", self.job_name_edit)
 
-        gallery_title = QLabel("Ảnh trong thư mục Images")
-        gallery_title.setStyleSheet("font-size: 16px; font-weight: bold;")
-        right_frame_layout.addWidget(gallery_title)
+        self.day_combo = QComboBox()
+        self.day_combo.addItems([label for label, _ in WEEKDAY_OPTIONS])
+        self.day_combo.setCurrentIndex(0)
+        self.day_combo.currentIndexChanged.connect(self.on_day_changed)
+        self.properties_form.addRow("Day", self.day_combo)
 
-        self.gallery_scroll = QScrollArea()
-        self.gallery_scroll.setWidgetResizable(True)
-        self.gallery_scroll.setFrameShape(QFrame.NoFrame)
+        self.start_edit = QLineEdit("08:00")
+        self.properties_form.addRow("Start", self.start_edit)
 
-        self.gallery_content = QWidget()
-        self.gallery_layout = QVBoxLayout(self.gallery_content)
-        self.gallery_layout.setSpacing(8)
-        self.gallery_layout.setAlignment(Qt.AlignTop)
+        self.end_edit = QLineEdit("09:00")
+        self.properties_form.addRow("End", self.end_edit)
 
-        self.gallery_scroll.setWidget(self.gallery_content)
-        right_frame_layout.addWidget(self.gallery_scroll, 1)
+        self.action_edit = QLineEdit(self.selected_action)
+        self.action_edit.setReadOnly(True)
+        self.properties_form.addRow("Action", self.action_edit)
 
-        main_layout.addWidget(left_frame)
-        main_layout.addWidget(right_frame, 1)
+        self.path_label = QLabel("Path")
+        self.path_edit = QLineEdit()
+        self.path_edit.textChanged.connect(lambda text: self.update_current_step("path", text))
+        self.path_browse_btn = QPushButton("Browse")
+        self.path_browse_btn.setFixedWidth(80)
+        self.path_browse_btn.clicked.connect(self.on_browse_path)
 
-        self.refresh_images_gallery()
+        path_row_widget = QWidget()
+        path_row_layout = QHBoxLayout(path_row_widget)
+        path_row_layout.setContentsMargins(0, 0, 0, 0)
+        path_row_layout.setSpacing(6)
+        path_row_layout.addWidget(self.path_edit, 1)
+        path_row_layout.addWidget(self.path_browse_btn)
 
-    def create_toolbar(self):
-        toolbar = QToolBar("Công cụ")
-        toolbar.setMovable(False)
-        self.addToolBar(Qt.TopToolBarArea, toolbar)
+        self.properties_form.addRow(self.path_label, path_row_widget)
 
-        action_config = QAction("Config", self)
-        action_config.setToolTip("Mở cửa sổ cấu hình lịch")
-        action_config.triggered.connect(self.open_config_dialog)
-        toolbar.addAction(action_config)
+        self.image_label = QLabel("Image")
+        self.image_edit = QLineEdit()
+        self.image_edit.textChanged.connect(lambda text: self.update_current_step("image", text))
+        self.properties_form.addRow(self.image_label, self.image_edit)
 
-    def open_config_dialog(self):
-        dialog = ConfigEditorDialog(self, self.config_file_path)
-        dialog.exec_()
+        self.timeout_label = QLabel("Timeout")
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(0, 600)
+        self.timeout_spin.setValue(10)
+        self.timeout_spin.valueChanged.connect(lambda value: self.update_current_step("timeout", value))
+        self.properties_form.addRow(self.timeout_label, self.timeout_spin)
 
-    def on_select_area(self):
-        # Ẩn cửa sổ chính trước, đợi 1 chút cho hiệu ứng ẩn hoàn tất
-        # rồi mới mở overlay chọn vùng (tránh overlay bị chụp/ảnh hưởng bởi cửa sổ chính).
-        self.hide()
-        QTimer.singleShot(150, self.start_selection)
+        self.confidence_label = QLabel("Confidence")
+        self.confidence_spin = QDoubleSpinBox()
+        self.confidence_spin.setRange(0.0, 1.0)
+        self.confidence_spin.setSingleStep(0.05)
+        self.confidence_spin.setValue(0.8)
+        self.confidence_spin.valueChanged.connect(lambda value: self.update_current_step("confidence", value))
+        self.properties_form.addRow(self.confidence_label, self.confidence_spin)
 
-    def start_selection(self):
-        self.overlay = SelectionOverlay(self.on_area_selected)
-        self.overlay.showFullScreen()
+        self.text_label = QLabel("Text")
+        self.text_edit = QLineEdit()
+        self.text_edit.textChanged.connect(lambda text: self.update_current_step("text", text))
+        self.properties_form.addRow(self.text_label, self.text_edit)
 
-    def on_area_selected(self, rect):
-        # Hiện lại cửa sổ chính sau khi chọn xong (hoặc hủy)
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        self.seconds_label = QLabel("Seconds")
+        self.seconds_spin = QSpinBox()
+        self.seconds_spin.setRange(0, 600)
+        self.seconds_spin.setValue(1)
+        self.seconds_spin.valueChanged.connect(lambda value: self.update_current_step("seconds", value))
+        self.properties_form.addRow(self.seconds_label, self.seconds_spin)
 
-        if rect is None or rect.width() == 0 or rect.height() == 0:
-            self.select_result_label.setText("Đã hủy chọn")
-            self.selected_rect = None
+        properties_layout.addLayout(self.properties_form)
+        properties_layout.addStretch(1)
+
+        images_panel = QFrame()
+        images_panel.setFrameShape(QFrame.StyledPanel)
+        images_layout = QVBoxLayout(images_panel)
+        images_layout.setContentsMargins(8, 8, 8, 8)
+        images_layout.setSpacing(8)
+
+        images_title = QLabel("Images")
+        images_title.setStyleSheet("font-weight: bold;")
+        images_layout.addWidget(images_title)
+
+        self.image_search_edit = QLineEdit()
+        self.image_search_edit.setPlaceholderText("Tìm ảnh...")
+        self.image_search_edit.textChanged.connect(self.refresh_images_list)
+        images_layout.addWidget(self.image_search_edit)
+
+        self.image_actions_row = QHBoxLayout()
+        self.btn_capture_image = QPushButton("Chụp ảnh")
+        self.btn_capture_image.clicked.connect(self.on_capture_image)
+        self.image_actions_row.addWidget(self.btn_capture_image)
+
+        self.btn_copy_image_path = QPushButton("Copy path")
+        self.btn_copy_image_path.clicked.connect(self.on_copy_selected_image_path)
+        self.image_actions_row.addWidget(self.btn_copy_image_path)
+
+        self.btn_test_image = QPushButton("Test ảnh")
+        self.btn_test_image.clicked.connect(self.on_test_selected_image)
+        self.image_actions_row.addWidget(self.btn_test_image)
+
+        self.image_actions_row.addStretch(1)
+        images_layout.addLayout(self.image_actions_row)
+
+        self.images_scroll = QScrollArea()
+        self.images_scroll.setWidgetResizable(True)
+        self.images_scroll.setFrameShape(QFrame.NoFrame)
+        self.images_content = QWidget()
+        self.images_layout = QVBoxLayout(self.images_content)
+        self.images_layout.setContentsMargins(0, 0, 0, 0)
+        self.images_layout.setSpacing(6)
+        self.images_layout.setAlignment(Qt.AlignTop)
+        self.images_scroll.setWidget(self.images_content)
+        images_layout.addWidget(self.images_scroll, 1)
+
+        splitter.addWidget(toolbox_panel)
+        splitter.addWidget(workflow_panel)
+        splitter.addWidget(properties_panel)
+        splitter.addWidget(images_panel)
+
+        buttons_row = QHBoxLayout()
+        ok_btn = QPushButton("Save")
+        ok_btn.clicked.connect(self.accept)
+        buttons_row.addStretch(1)
+        buttons_row.addWidget(ok_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons_row.addWidget(cancel_btn)
+        main_layout.addLayout(buttons_row)
+
+        self.refresh_workflow_list()
+        self.refresh_images_list()
+        self.refresh_properties_for_action(self.selected_action_key)
+
+    def accept(self):
+        job_name = self.job_name_edit.text().strip()
+        if not job_name:
+            QMessageBox.warning(self, "Set Job", "Vui lòng nhập tên job.")
             return
 
-        self.selected_rect = rect
-        text = (
-            f"X: {rect.x()}, Y: {rect.y()}\n"
-            f"W: {rect.width()}, H: {rect.height()}"
-        )
-        self.select_result_label.setText(text)
-
-    def on_capture_area(self):
-        # Ẩn cửa sổ chính trước, đợi 1 chút cho hiệu ứng ẩn hoàn tất
-        # rồi mới mở overlay chọn vùng cần chụp.
-        self.hide()
-        QTimer.singleShot(150, self.start_capture_selection)
-
-    def start_capture_selection(self):
-        self.overlay = SelectionOverlay(self.on_capture_area_selected)
-        self.overlay.showFullScreen()
-
-    def on_capture_area_selected(self, rect):
-        if rect is None or rect.width() == 0 or rect.height() == 0:
-            self.show()
-            self.raise_()
-            self.activateWindow()
-            self.capture_result_label.setText("Đã hủy chọn")
+        self.save_current_step_to_workflow()
+        self.workflow_data = [self.normalize_workflow_step(step) for step in self.workflow_steps]
+        if self.save_to_config(job_name):
+            self.selected_job_name = job_name
+            self.refresh_job_list()
+            self.load_job_by_name(job_name)
+            try:
+                trigger_scheduler_reload()
+            except Exception:
+                pass
             return
 
-        # store the captured rect so we can use its coords when saving
-        self.captured_rect = rect
+    def save_current_step_to_workflow(self):
+        row = self.workflow_list.currentRow()
+        if 0 <= row < len(self.workflow_steps):
+            self.workflow_steps[row] = self.build_current_step()
 
-        # Đợi 1 chút để overlay biến mất hoàn toàn khỏi màn hình
-        # (tránh chụp phải lớp phủ mờ / viền rubber band còn sót lại),
-        # rồi mới thực sự chụp ảnh.
-        QTimer.singleShot(100, lambda: self.grab_and_show_capture(rect))
+    def normalize_workflow_step(self, step):
+        action = str(step.get("action") or self.selected_action_key or "").strip()
+        normalized = {"action": action}
 
-    def grab_and_show_capture(self, rect):
-        screen = QApplication.primaryScreen()
-        pixmap = screen.grabWindow(
-            0, rect.x(), rect.y(), rect.width(), rect.height()
-        )
+        if action in {"open_app", "close_app"}:
+            normalized["path"] = normalize_app_path(step.get("path"))
+        elif action in {"click_image", "wait_image"}:
+            normalized["image"] = str(step.get("image") or "").strip()
+            normalized["timeout"] = int(step.get("timeout", 10) or 10)
+            normalized["confidence"] = float(step.get("confidence", 0.8) or 0.8)
+        elif action == "paste":
+            normalized["text"] = str(step.get("text") or "")
+        elif action == "sleep":
+            normalized["seconds"] = int(step.get("seconds", 1) or 1)
 
-        # Sau khi chụp xong mới hiện lại cửa sổ chính
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        return normalized
 
-        if pixmap.isNull():
-            self.capture_result_label.setText("Chụp thất bại")
-            return
-
-        self.captured_pixmap = pixmap
-        self.display_capture_thumbnail(pixmap)
-        self.save_captured_image(pixmap)
-
-    def get_images_dir(self):
-        # Thư mục Images nằm cạnh file chương trình
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "Images")
-
-    def save_captured_image(self, pixmap):
-        # Hỏi tên file để lưu ảnh (hiển thị tên cơ sở không gồm toạ độ)
-        default_base = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-        # chuẩn bị chuỗi toạ độ (mở rộng 10px mỗi cạnh) nhưng không hiển thị
-        coords_str = ""
+    def save_to_config(self, job_name):
+        config_path = self.config_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
         try:
-            if hasattr(self, "captured_rect") and self.captured_rect is not None:
-                r = self.captured_rect
-                x = max(0, r.x() - 10)
-                y = max(0, r.y() - 10)
-                w = r.width() + 20
-                h = r.height() + 20
-                coords_str = f"{x}_{y}_{w}_{h}"
-        except Exception:
-            coords_str = ""
+            config = load_config_file(config_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Set Job", f"Không đọc được config.json:\n{exc}")
+            return False
+
+        schedule = config.setdefault("schedule", {})
+        day_cfg = schedule.setdefault(self.selected_day_key, {})
+        day_cfg[job_name] = {
+            "start": self.start_edit.text().strip() or "08:00",
+            "end": self.end_edit.text().strip() or "09:00",
+            "workflow": self.workflow_data,
+        }
+
+        try:
+            save_config_file(config_path, config)
+        except Exception as exc:
+            QMessageBox.warning(self, "Set Job", f"Không lưu được vào config.json:\n{exc}")
+            return False
+
+        QMessageBox.information(self, "Set Job", f"Đã lưu job '{job_name}' vào config.json")
+        return True
+
+    def refresh_job_list(self):
+        self.job_names = get_job_function_names(self.config_path)
+        self.job_list_widget.blockSignals(True)
+        self.job_list_widget.clear()
+        if self.job_names:
+            for job_name in self.job_names:
+                row_widget = JobListRow(
+                    job_name,
+                    on_test=self.on_test_job_clicked,
+                    on_delete=self.on_delete_job_clicked,
+                )
+                item = QListWidgetItem(self.job_list_widget)
+                item.setSizeHint(row_widget.sizeHint())
+                self.job_list_widget.setItemWidget(item, row_widget)
+        else:
+            item = QListWidgetItem("(Chưa có job)")
+            self.job_list_widget.addItem(item)
+        if self.selected_job_name and self.selected_job_name in self.job_names:
+            for index in range(self.job_list_widget.count()):
+                item = self.job_list_widget.item(index)
+                widget = self.job_list_widget.itemWidget(item)
+                if widget is not None and getattr(widget, "job_name", "") == self.selected_job_name:
+                    self.job_list_widget.setCurrentRow(index)
+                    break
+        elif self.job_names:
+            self.job_list_widget.setCurrentRow(0)
+        self.job_list_widget.blockSignals(False)
+
+    def on_job_list_selected(self):
+        selected_item = self.job_list_widget.currentItem()
+        if not selected_item:
+            return
+        widget = self.job_list_widget.itemWidget(selected_item)
+        if widget is not None:
+            job_name = getattr(widget, "job_name", "")
+        else:
+            job_name = selected_item.text().strip()
+        if not job_name or job_name == "(Chưa có job)":
+            return
+        self.load_job_by_name(job_name)
+
+    def on_test_job_clicked(self, job_name):
+        if not job_name:
+            return
+        self.load_job_by_name(job_name)
+        self.save_current_step_to_workflow()
+        self.workflow_data = [self.normalize_workflow_step(step) for step in self.workflow_steps]
+        try:
+            from auto import execute_workflow
+            execute_workflow(self.workflow_data)
+            QMessageBox.information(self, "Test Job", f"Đã chạy thử job '{job_name}'")
+        except Exception as exc:
+            QMessageBox.warning(self, "Test Job", f"Không thể chạy thử job '{job_name}':\n{exc}")
+
+    def on_delete_job_clicked(self, job_name):
+        if not job_name:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Xóa job",
+            f"Xóa job '{job_name}' khỏi config.json?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            config = load_config_file(self.config_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Xóa job", f"Không đọc được config.json:\n{exc}")
+            return
+
+        schedule = config.setdefault("schedule", {})
+        removed = False
+        for day_key, day_cfg in schedule.items():
+            if isinstance(day_cfg, dict) and job_name in day_cfg:
+                del day_cfg[job_name]
+                removed = True
+                break
+
+        if not removed:
+            QMessageBox.warning(self, "Xóa job", f"Không tìm thấy job '{job_name}' để xóa.")
+            return
+
+        try:
+            save_config_file(self.config_path, config)
+            trigger_scheduler_reload()
+        except Exception as exc:
+            QMessageBox.warning(self, "Xóa job", f"Không thể xóa job:\n{exc}")
+            return
+
+        QMessageBox.information(self, "Xóa job", f"Đã xóa job '{job_name}' khỏi config.json.")
+        self.selected_job_name = ""
+        self.selected_job_config = None
+        self.job_name_edit.setText("new_job")
+        self.workflow_steps = []
+        self.workflow_data = []
+        self.refresh_job_list()
+        self.refresh_workflow_list()
+        self.refresh_properties_for_action(self.selected_action_key)
+
+    def create_new_job(self):
+        self.selected_job_name = ""
+        self.selected_job_config = None
+        self.job_name_edit.setText("new_job")
+        self.job_name_edit.selectAll()
+        self.day_combo.setCurrentIndex(0)
+        self.start_edit.setText("08:00")
+        self.end_edit.setText("09:00")
+        self.workflow_steps = []
+        self.refresh_workflow_list()
+        self.refresh_properties_for_action(self.selected_action_key)
+        self.job_list_widget.clearSelection()
+
+    def load_job_by_name(self, job_name):
+        if not job_name:
+            return
+        self.selected_job_name = job_name
+        self.job_name_edit.setText(job_name)
+        config = load_config_file(self.config_path)
+        schedule = config.get("schedule", {})
+        found_day_key = None
+        found_job_cfg = None
+        for day_key, day_cfg in schedule.items():
+            if not isinstance(day_cfg, dict):
+                continue
+            job_cfg = day_cfg.get(job_name)
+            if isinstance(job_cfg, dict):
+                found_day_key = str(day_key)
+                found_job_cfg = job_cfg
+                break
+
+        if found_job_cfg is None:
+            self.selected_job_config = None
+            self.workflow_steps = []
+            self.refresh_workflow_list()
+            self.refresh_properties_for_action(self.selected_action_key)
+            return
+
+        self.selected_job_config = found_job_cfg
+        self.selected_day_key = found_day_key or self.selected_day_key
+        self.day_combo.setCurrentIndex(int(self.selected_day_key) if self.selected_day_key.isdigit() and 0 <= int(self.selected_day_key) <= 6 else 0)
+        self.start_edit.setText(found_job_cfg.get("start", "08:00"))
+        self.end_edit.setText(found_job_cfg.get("end", "09:00"))
+
+        self.workflow_steps = []
+        for step in found_job_cfg.get("workflow", []):
+            action = step.get("action", "")
+            display_name = self.get_action_display_name(action)
+            if action in {"open_app", "close_app"}:
+                self.workflow_steps.append({
+                    "name": display_name,
+                    "action": action,
+                    "path": step.get("path", ""),
+                    "image": "",
+                    "timeout": 10,
+                    "confidence": 0.8,
+                    "text": "",
+                    "seconds": 1,
+                })
+            elif action in {"click_image", "wait_image"}:
+                self.workflow_steps.append({
+                    "name": display_name,
+                    "action": action,
+                    "path": "",
+                    "image": step.get("image", ""),
+                    "timeout": int(step.get("timeout", 10) or 10),
+                    "confidence": float(step.get("confidence", 0.8) or 0.8),
+                    "text": "",
+                    "seconds": 1,
+                })
+            elif action == "paste":
+                self.workflow_steps.append({
+                    "name": display_name,
+                    "action": action,
+                    "path": "",
+                    "image": "",
+                    "timeout": 10,
+                    "confidence": 0.8,
+                    "text": step.get("text", ""),
+                    "seconds": 1,
+                })
+            elif action == "sleep":
+                self.workflow_steps.append({
+                    "name": display_name,
+                    "action": action,
+                    "path": "",
+                    "image": "",
+                    "timeout": 10,
+                    "confidence": 0.8,
+                    "text": "",
+                    "seconds": int(step.get("seconds", 1) or 1),
+                })
+            else:
+                self.workflow_steps.append({
+                    "name": display_name or action,
+                    "action": action,
+                    "path": "",
+                    "image": "",
+                    "timeout": 10,
+                    "confidence": 0.8,
+                    "text": "",
+                    "seconds": 1,
+                })
+
+        self.refresh_workflow_list()
+        if self.workflow_steps:
+            self.workflow_list.setCurrentRow(0)
+            self.on_workflow_selection_changed(self.workflow_list.item(0), None)
+        else:
+            self.refresh_properties_for_action(self.selected_action_key)
+
+    def get_action_display_name(self, action_key):
+        for name, key in self.ACTIONS:
+            if key == action_key:
+                return name
+        return action_key or ""
+
+    def on_day_changed(self, index):
+        self.selected_day_key = str(index)
+
+    def filter_toolbox(self, text):
+        search = text.lower().strip()
+        for index in range(self.toolbox_list.count()):
+            item = self.toolbox_list.item(index)
+            item.setHidden(search and search not in item.text().lower())
+
+    def refresh_workflow_list(self, preserve_row=None):
+        self.workflow_list.clear()
+        for index, step in enumerate(self.workflow_steps, start=1):
+            display_name = step.get("name") or self.selected_action
+            item = QListWidgetItem(f"{index}. {display_name}")
+            item.setData(Qt.UserRole, step)
+            self.workflow_list.addItem(item)
+        if self.workflow_steps:
+            target_row = 0
+            if preserve_row is not None:
+                target_row = max(0, min(int(preserve_row), self.workflow_list.count() - 1))
+            self.workflow_list.setCurrentRow(target_row)
+
+    def reorder_workflow_steps(self):
+        reordered = []
+        for index in range(self.workflow_list.count()):
+            item = self.workflow_list.item(index)
+            if item is None:
+                continue
+            step = item.data(Qt.UserRole)
+            if isinstance(step, dict):
+                reordered.append(step)
+        if len(reordered) != len(self.workflow_steps):
+            return
+        current_row = self.workflow_list.currentRow()
+        self.workflow_steps = reordered
+        self.refresh_workflow_list(preserve_row=current_row)
+
+    def refresh_properties_for_action(self, action_key):
+        is_path_action = action_key in {"open_app", "close_app"}
+        is_image_action = action_key in {"click_image", "wait_image"}
+        is_paste_action = action_key == "paste"
+        is_sleep_action = action_key == "sleep"
+
+        self.set_row_visible(self.path_label, self.path_browse_btn, is_path_action)
+        self.path_edit.setVisible(is_path_action)
+        self.path_browse_btn.setVisible(is_path_action)
+        self.set_row_visible(self.image_label, self.image_edit, is_image_action)
+        self.set_row_visible(self.timeout_label, self.timeout_spin, is_image_action)
+        self.set_row_visible(self.confidence_label, self.confidence_spin, is_image_action)
+        self.set_row_visible(self.text_label, self.text_edit, is_paste_action)
+        self.set_row_visible(self.seconds_label, self.seconds_spin, is_sleep_action)
+
+    def set_row_visible(self, label, widget, visible):
+        label.setVisible(visible)
+        widget.setVisible(visible)
+
+    def on_toolbox_selection_changed(self, current, previous):
+        if current is None:
+            return
+        self.selected_action = current.text()
+        self.selected_action_key = self.get_action_key(self.selected_action)
+        self.action_name_label.setText(self.selected_action)
+        self.action_edit.setText(self.selected_action)
+        self.refresh_properties_for_action(self.selected_action_key)
+
+    def on_workflow_selection_changed(self, current, previous):
+        if current is None:
+            return
+        row = self.workflow_list.currentRow()
+        if 0 <= row < len(self.workflow_steps):
+            step = self.workflow_steps[row]
+            self.selected_action = step.get("name", self.selected_action)
+            self.selected_action_key = step.get("action", self.get_action_key(self.selected_action))
+            self.action_edit.setText(self.selected_action)
+            self.action_name_label.setText(self.selected_action)
+            self.path_edit.setText(step.get("path", ""))
+            self.image_edit.setText(step.get("image", ""))
+            self.timeout_spin.setValue(int(step.get("timeout", 10)))
+            self.confidence_spin.setValue(float(step.get("confidence", 0.8)))
+            self.text_edit.setText(step.get("text", ""))
+            self.seconds_spin.setValue(int(step.get("seconds", 1)))
+            self.refresh_properties_for_action(self.selected_action_key)
+
+    def on_browse_path(self):
+        if self.selected_action_key not in {"open_app", "close_app"}:
+            return
+
+        start_dir = self.path_edit.text().strip() or os.path.expanduser("~")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file thực thi",
+            start_dir,
+            "Executables (*.exe);;All files (*)"
+        )
+        if file_path:
+            self.path_edit.setText(file_path)
+            self.update_current_step("path", file_path)
+
+    def add_current_step(self):
+        step = self.build_current_step()
+        self.workflow_steps.append(step)
+        self.refresh_workflow_list()
+        self.workflow_list.setCurrentRow(len(self.workflow_steps) - 1)
+
+    def remove_current_step(self):
+        row = self.workflow_list.currentRow()
+        if 0 <= row < len(self.workflow_steps):
+            del self.workflow_steps[row]
+            self.refresh_workflow_list()
+
+    def build_current_step(self):
+        return {
+            "name": self.selected_action,
+            "action": self.selected_action_key,
+            "path": self.path_edit.text().strip(),
+            "image": self.image_edit.text().strip(),
+            "timeout": self.timeout_spin.value(),
+            "confidence": self.confidence_spin.value(),
+            "text": self.text_edit.text(),
+            "seconds": self.seconds_spin.value(),
+        }
+
+    def update_current_step(self, key, value):
+        row = self.workflow_list.currentRow()
+        if 0 <= row < len(self.workflow_steps):
+            step = self.workflow_steps[row]
+            step["name"] = self.selected_action
+            step["action"] = self.selected_action_key
+            step[key] = value
+
+    def refresh_images_list(self, text=None):
+        while self.images_layout.count():
+            item = self.images_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        search = (text or self.image_search_edit.text() or "").lower().strip()
+        images_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Images")
+        if not os.path.isdir(images_dir):
+            empty_label = QLabel("Chưa có ảnh nào trong thư mục Images")
+            empty_label.setStyleSheet("color: #777;")
+            self.images_layout.addWidget(empty_label)
+            return
+
+        files = []
+        valid_ext = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
+        for filename in os.listdir(images_dir):
+            if filename.lower().endswith(valid_ext):
+                if search and search not in filename.lower():
+                    continue
+                files.append(os.path.join(images_dir, filename))
+
+        if not files:
+            empty_label = QLabel("Không tìm thấy ảnh phù hợp")
+            empty_label.setStyleSheet("color: #777;")
+            self.images_layout.addWidget(empty_label)
+            return
+
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+        for file_path in files:
+            row = ImageFileRow(file_path)
+            row.clicked.connect(lambda checked=False, path=file_path, row=row: self.on_image_row_clicked(path, row))
+            row.double_clicked.connect(self.on_image_double_clicked)
+            row.delete_clicked.connect(self.on_delete_image_from_setjob)
+            self.images_layout.addWidget(row)
+
+    def on_image_double_clicked(self, file_path):
+        self.assign_image_to_current_step(file_path)
+
+    def on_image_row_clicked(self, file_path, row):
+        self.selected_image_path = file_path
+        self._highlight_selected_image_row(row)
+
+    def _highlight_selected_image_row(self, selected_row):
+        for i in range(self.images_layout.count()):
+            item = self.images_layout.itemAt(i)
+            widget = item.widget()
+            if isinstance(widget, ImageFileRow):
+                widget.set_selected(widget is selected_row)
+
+    def _get_selected_image_path(self):
+        if self.selected_image_path and os.path.isfile(self.selected_image_path):
+            return self.selected_image_path
+        return self.image_edit.text().strip()
+
+    def assign_image_to_current_step(self, file_path):
+        row = self.workflow_list.currentRow()
+        if 0 <= row < len(self.workflow_steps):
+            self.workflow_steps[row]["image"] = file_path
+            self.image_edit.setText(file_path)
+            QMessageBox.information(self, "Set Job", f"Đã gán ảnh cho bước hiện tại:\n{os.path.basename(file_path)}")
+
+    def on_capture_image(self):
+        # Reuse the main window capture overlay behavior inside Set Job
+        self.hide()
+        self.capture_overlay = SelectionOverlay(self.on_capture_image_selected)
+        self.capture_overlay.showFullScreen()
+
+    def on_capture_image_selected(self, rect):
+        self.show()
+        self.raise_()
+        if rect is None or rect.width() == 0 or rect.height() == 0:
+            QMessageBox.information(self, "Set Job", "Đã hủy chọn ảnh.")
+            return
+        screen = QApplication.primaryScreen()
+        pixmap = screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height())
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Set Job", "Chụp ảnh thất bại.")
+            return
+
+        self.captured_rect = rect
+        self.save_captured_image_for_setjob(pixmap)
+
+    def save_captured_image_for_setjob(self, pixmap):
+        images_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Images")
+        try:
+            os.makedirs(images_dir, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "Lưu ảnh", f"Không thể tạo thư mục Images:\n{e}")
+            return
+
+        default_base = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        coords_str = ""
+        if hasattr(self, "captured_rect") and self.captured_rect is not None:
+            r = self.captured_rect
+            x = max(0, r.x() - 10)
+            y = max(0, r.y() - 10)
+            w = r.width() + 20
+            h = r.height() + 20
+            coords_str = f"{x}_{y}_{w}_{h}"
 
         name, ok = QInputDialog.getText(
             self,
@@ -950,25 +1170,11 @@ class MainWindow(QMainWindow):
             return
 
         name = name.strip()
-        # Nếu người dùng nhập .png thì bỏ phần ext để chúng ta tự gắn lại sau khi ghép coords
         if name.lower().endswith('.png'):
             name = name[:-4]
 
         name = sanitize_filename_part(name)
-
-        # Tạo tên cuối cùng bằng cách ghép tên người dùng + toạ độ (nếu có) + .png
-        if coords_str:
-            final_name = f"{name}={coords_str}=.png"
-        else:
-            final_name = f"{name}.png"
-
-        images_dir = self.get_images_dir()
-        try:
-            os.makedirs(images_dir, exist_ok=True)
-        except OSError as e:
-            QMessageBox.warning(self, "Lưu ảnh", f"Không thể tạo thư mục Images:\n{e}")
-            return
-
+        final_name = f"{name}.png" if not coords_str else f"{name}={coords_str}=.png"
         save_path = os.path.join(images_dir, final_name)
 
         if os.path.exists(save_path):
@@ -982,354 +1188,74 @@ class MainWindow(QMainWindow):
                 return
 
         if pixmap.save(save_path, "PNG"):
-            QMessageBox.information(self, "Lưu ảnh", f"Đã lưu ảnh vào:\n{save_path}")
-            self.captured_image_path = save_path
-            self.refresh_images_gallery()
+            QMessageBox.information(self, "Set Job", f"Đã lưu ảnh vào:\n{save_path}")
+            self.refresh_images_list()
+            self.assign_image_to_current_step(save_path)
         else:
-            QMessageBox.warning(self, "Lưu ảnh", "Không thể lưu ảnh.")
+            QMessageBox.warning(self, "Set Job", "Không thể lưu ảnh.")
 
-    def refresh_images_gallery(self):
-        # Xóa toàn bộ ảnh cũ đang hiển thị trong danh sách
-        while self.gallery_layout.count():
-            item = self.gallery_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        images_dir = self.get_images_dir()
-        valid_ext = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
-        disk_files = []
-        if os.path.isdir(images_dir):
-            disk_files = sorted(
-                f for f in os.listdir(images_dir) if f.lower().endswith(valid_ext)
-            )
-
-        # Build displayed_files preserving previous order in self.gallery_files
-        if not disk_files:
-            placeholder = QLabel("Chưa có ảnh nào trong thư mục Images")
-            placeholder.setAlignment(Qt.AlignCenter)
-            placeholder.setStyleSheet("color: #777; font-size: 14px;")
-            self.gallery_layout.addWidget(placeholder)
-            return
-        # If we have a previous ordering, keep those files in that order
-        if not self.gallery_files:
-            displayed_files = disk_files[:]
+    def on_copy_selected_image_path(self):
+        path = self._get_selected_image_path()
+        if path:
+            QApplication.clipboard().setText(path)
+            QMessageBox.information(self, "Set Job", "Đã copy đường dẫn ảnh.")
         else:
-            # Keep existing files in order, append any new files at the end
-            remaining = disk_files[:]
-            displayed_files = []
-            for f in self.gallery_files:
-                if f in remaining:
-                    displayed_files.append(f)
-                    remaining.remove(f)
-            displayed_files.extend(remaining)
+            QMessageBox.information(self, "Set Job", "Chưa chọn ảnh để copy.")
 
-        # Update stored order
-        self.gallery_files = displayed_files
-
-        thumb_size = 60
-        for filename in displayed_files:
-            file_path = os.path.join(images_dir, filename)
-            pixmap = QPixmap(file_path)
-            if pixmap.isNull():
-                continue
-            thumb = pixmap.scaled(
-                thumb_size, thumb_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-
-            row_widget = QFrame()
-            row_widget.setFrameShape(QFrame.StyledPanel)
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(8, 8, 8, 8)
-            row_layout.setSpacing(10)
-
-            img_label = QLabel()
-            img_label.setPixmap(thumb)
-            img_label.setAlignment(Qt.AlignCenter)
-            img_label.setFixedSize(thumb_size, thumb_size)
-            row_layout.addWidget(img_label)
-
-            name_label = ElidedLabel(filename)
-            name_label.setWordWrap(False)
-            name_label.setStyleSheet("font-size: 12px;")
-            name_label.setToolTip(filename)
-            name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            row_layout.addWidget(name_label, 1)
-
-            btn_copy_path = QPushButton("Copy")
-            btn_copy_path.setFixedWidth(70)
-            btn_copy_path.clicked.connect(
-                lambda checked=False, path=file_path: self.on_copy_image_path(path)
-            )
-            row_layout.addWidget(btn_copy_path)
-
-            btn_rename = QPushButton("Rename")
-            btn_rename.setFixedWidth(70)
-            btn_rename.clicked.connect(
-                lambda checked=False, path=file_path: self.on_rename_image(path)
-            )
-            row_layout.addWidget(btn_rename)
-
-            btn_delete = QPushButton("Delete")
-            btn_delete.setFixedWidth(70)
-            btn_delete.clicked.connect(
-                lambda checked=False, path=file_path: self.on_delete_image(path)
-            )
-            row_layout.addWidget(btn_delete)
-
-            btn_test = QPushButton("Test")
-            btn_test.setFixedWidth(70)
-            btn_test.clicked.connect(
-                lambda checked=False, path=file_path, btn=btn_test: self.on_test_image(path, btn)
-            )
-            row_layout.addWidget(btn_test)
-
-            self.gallery_layout.addWidget(row_widget)
-
-    def on_copy_image_path(self, file_path):
-        QApplication.clipboard().setText(file_path)
-
-    def on_delete_image(self, file_path):
+    def on_delete_image_from_setjob(self, file_path):
         reply = QMessageBox.question(
             self,
             "Xóa ảnh",
-            f"Bạn có chắc muốn xóa file:\n{file_path}?",
+            f"Bạn có muốn xóa ảnh sau khỏi thư mục Images?\n{file_path}",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
+
         try:
             os.remove(file_path)
         except OSError as e:
             QMessageBox.warning(self, "Xóa ảnh", f"Không thể xóa file:\n{e}")
             return
-        # remove from gallery_files to keep order
-        basename = os.path.basename(file_path)
-        if basename in self.gallery_files:
-            self.gallery_files.remove(basename)
-        self.refresh_images_gallery()
 
-    def on_rename_image(self, file_path):
-        dirpath = os.path.dirname(file_path)
-        basename = os.path.basename(file_path)
-        old_name, old_ext = os.path.splitext(basename)
+        # Nếu ảnh đang được chọn trong bước hiện tại, bỏ chọn luôn
+        if self.image_edit.text().strip() == file_path:
+            self.image_edit.clear()
+            row = self.workflow_list.currentRow()
+            if 0 <= row < len(self.workflow_steps):
+                self.workflow_steps[row]["image"] = ""
 
-        # Detect coords pattern at the end of the base name, supporting both
-        # old format: name_0_180_60_52 and new format: name=0_180_60_52=
-        m = re.search(r"^(?P<base>.*)=(?P<x>-?\d+)_(?P<y>-?\d+)_(?P<w>\d+)_(?P<h>\d+)=$", old_name)
-        if not m:
-            m = re.search(r"^(?P<base>.*)_(?P<x>-?\d+)_(?P<y>-?\d+)_(?P<w>\d+)_(?P<h>\d+)$", old_name)
+        if self.selected_image_path == file_path:
+            self.selected_image_path = ""
+        self.refresh_images_list()
 
-        if m:
-            coords = f"{m.group('x')}_{m.group('y')}_{m.group('w')}_{m.group('h')}"
-            base_no_coords = m.group('base')
-        else:
-            coords = None
-            base_no_coords = old_name
-
-        # Show input with the prefix only (without coords) so user edits only that part
-        new_input, ok = QInputDialog.getText(
-            self,
-            "Đổi tên",
-            "Chỉ sửa phần tên trước toạ độ (phần toạ độ được giữ tự động):",
-            text=base_no_coords,
-        )
-        if not ok or not new_input.strip():
+    def on_test_selected_image(self):
+        path = self._get_selected_image_path()
+        if not path or not os.path.isfile(path):
+            QMessageBox.information(self, "Set Job", "Chưa chọn ảnh hợp lệ để test.")
             return
-        new_input = new_input.strip()
+        from auto import click_image
 
-        # If user included an extension in the input, respect it; otherwise keep old_ext
-        new_root, new_ext = os.path.splitext(new_input)
-        if new_ext == "":
-            new_ext = old_ext
-
-        new_root = sanitize_filename_part(new_root)
-
-        # Construct final basename: new_root + =coords= (if existed) + ext
-        if coords:
-            final_basename = f"{new_root}={coords}={new_ext}"
-        else:
-            final_basename = f"{new_root}{new_ext}"
-
-        new_path = os.path.join(dirpath, final_basename)
-        if os.path.exists(new_path):
-            reply = QMessageBox.question(
-                self,
-                "File đã tồn tại",
-                f"File \"{final_basename}\" đã tồn tại. Ghi đè?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        try:
-            os.rename(file_path, new_path)
-        except OSError as e:
-            QMessageBox.warning(self, "Đổi tên", f"Không thể đổi tên file:\n{e}")
-            return
-
-        # update stored order: replace old basename with new one at same index
-        old_basename = os.path.basename(file_path)
-        new_basename = os.path.basename(new_path)
-        try:
-            idx = self.gallery_files.index(old_basename)
-            self.gallery_files[idx] = new_basename
-        except ValueError:
-            # not found -> append to end
-            self.gallery_files.append(new_basename)
-
-        self.refresh_images_gallery()
-
-    def on_test_image(self, file_path, button):
-        if not os.path.isfile(file_path):
-            QMessageBox.warning(self, "Test", "File ảnh không tồn tại.")
-            return
-
-        button.setEnabled(False)
-        original_text = button.text()
-        button.setText("...")
-
-        self._begin_test()
-        # Đợi 1 chút để cửa sổ ẩn hoàn tất rồi mới thực sự chạy click_image
-        QTimer.singleShot(
-            150, lambda: self._start_test_image_thread(file_path, button, original_text)
-        )
-
-    def _start_test_image_thread(self, file_path, button, original_text):
-        thread = ClickTestThread(file_path)
-        self.gallery_test_threads.append(thread)
-
-        def on_finished(success, error, btn=button, orig=original_text, th=thread):
-            self._end_test()
-
-            btn.setEnabled(True)
-            btn.setText(orig)
-            if th in self.gallery_test_threads:
-                self.gallery_test_threads.remove(th)
-
-            if error:
-                QMessageBox.warning(self, "Test", f"Lỗi khi test click:\n{error}")
-            elif success:
-                QMessageBox.information(self, "Test", "Đã click thành công vào ảnh trên màn hình.")
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Test",
-                    "Không tìm thấy ảnh trên màn hình trong thời gian chờ (timeout).",
-                )
-
-        thread.finished_signal.connect(on_finished)
-        thread.start()
-
-    def display_capture_thumbnail(self, pixmap):
-        # Hiện ảnh thu nhỏ ngay trong ô bên dưới nút "Chọn vùng chụp"
-        thumb = pixmap.scaled(
-            self.capture_result_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.capture_result_label.setPixmap(thumb)
-        self.capture_result_label.setStyleSheet("padding: 0px;")
-
-    def on_get_mouse_position(self):
-        # Ẩn cửa sổ chính trước, đợi 1 chút rồi mới mở overlay chờ click
         self.hide()
-        QTimer.singleShot(150, self.start_position_pick)
+        QTimer.singleShot(150, lambda: self._test_image_path(path, click_image))
 
-    def start_position_pick(self):
-        self.overlay = PositionPickerOverlay(self.on_position_picked)
-        self.overlay.showFullScreen()
-
-    def on_position_picked(self, point):
-        # Hiện lại cửa sổ chính sau khi click xong (hoặc hủy)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-        if point is None:
-            self.mouse_result_label.setText("Đã hủy")
-            self.mouse_position = None
-            return
-
-        self.mouse_position = point
-        text = f"X: {point.x()}\nY: {point.y()}"
-        self.mouse_result_label.setText(text)
-
-    def on_copy_select(self):
-        if self.selected_rect is None:
-            QMessageBox.information(self, "Copy", "Chưa có vùng nào được chọn.")
-            return
-        rect = self.selected_rect
-        text = f"({rect.x()},{rect.y()},{rect.width()},{rect.height()})"
-        QApplication.clipboard().setText(text)
-
-    def on_copy_capture(self):
-        if self.captured_image_path is None:
-            QMessageBox.information(self, "Copy", "Chưa có ảnh nào được lưu.")
-            return
-        QApplication.clipboard().setText(self.captured_image_path)
-
-    def _begin_test(self):
-        # Ẩn cửa sổ khi bắt đầu test (chỉ ẩn ở lượt test đầu tiên nếu có nhiều test chạy song song)
-        self.active_test_count += 1
-        if self.active_test_count == 1:
-            self.hide()
-
-    def _end_test(self):
-        # Hiện lại cửa sổ khi test cuối cùng đang chạy đã xong
-        self.active_test_count = max(0, self.active_test_count - 1)
-        if self.active_test_count == 0:
+    def _test_image_path(self, path, click_image_func):
+        try:
+            click_image_func(path)
+            QMessageBox.information(self, "Set Job", "Test ảnh thành công.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Set Job", f"Lỗi khi test ảnh:\n{exc}")
+        finally:
             self.show()
             self.raise_()
-            self.activateWindow()
 
-    def on_test_capture(self):
-        if not self.captured_image_path or not os.path.isfile(self.captured_image_path):
-            QMessageBox.information(self, "Test", "Chưa có ảnh nào được lưu để test.")
-            return
 
-        self.btn_test_capture.setEnabled(False)
-        self.btn_test_capture.setText("Đang test...")
 
-        self._begin_test()
-        # Đợi 1 chút để cửa sổ ẩn hoàn tất rồi mới thực sự chạy click_image
-        QTimer.singleShot(
-            150, lambda: self._start_test_capture_thread(self.captured_image_path)
-        )
-
-    def _start_test_capture_thread(self, image_path):
-        self.test_thread = ClickTestThread(image_path)
-        self.test_thread.finished_signal.connect(self.on_test_finished)
-        self.test_thread.start()
-
-    def on_test_finished(self, success, error):
-        self._end_test()
-
-        self.btn_test_capture.setEnabled(True)
-        self.btn_test_capture.setText("Test")
-
-        if error:
-            QMessageBox.warning(self, "Test", f"Lỗi khi test click:\n{error}")
-        elif success:
-            QMessageBox.information(self, "Test", "Đã click thành công vào ảnh trên màn hình.")
-        else:
-            QMessageBox.warning(
-                self,
-                "Test",
-                "Không tìm thấy ảnh trên màn hình trong thời gian chờ (timeout).",
-            )
-
-    def on_copy_mouse(self):
-        if self.mouse_position is None:
-            QMessageBox.information(self, "Copy", "Chưa lấy vị trí chuột nào.")
-            return
-        point = self.mouse_position
-        text = f"X={point.x()}, Y={point.y()}"
-        QApplication.clipboard().setText(text)
 
 
 def main():
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = SetJobDialog(None)
     window.show()
     sys.exit(app.exec_())
 

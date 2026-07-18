@@ -6,13 +6,15 @@
         "3": {},
         "4": {},
         "5": {
-            "test1": {
-                "start": "14:30",
-                "end": "14:30"
-            },
-            "test2": {
-                "start": "14:31",
-                "end": "14:31"
+            "mở cốc cốc": {
+                "start": "18:39",
+                "end": "18:39",
+                "workflow": [
+                    {
+                        "action": "open_app",
+                        "path": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+                    }
+                ]
             }
         },
         "6": {}

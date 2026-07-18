@@ -1,6 +1,7 @@
 import os
 import time
 import subprocess
+import threading
 import pyperclip
 import psutil
 import pyautogui
@@ -16,6 +17,9 @@ pyautogui.FAILSAFE = True      # Đưa chuột lên góc trái để dừng scri
 pyautogui.PAUSE = 0.1          # Nghỉ 0.1s sau mỗi thao tác
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 RELOAD_SIGNAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_reload.signal")
+PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduler.pid")
+HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduler.heartbeat")
+HEARTBEAT_INTERVAL = 2
 WEEKDAY_NAME = [
     "Thứ 2",
     "Thứ 3",
@@ -26,12 +30,96 @@ WEEKDAY_NAME = [
     "Chủ nhật"
 ]
 
-# ==========================
-# LOG
-# ==========================
-
 def log(message):
-    print(f"[{time.strftime('%H:%M:%S')}] {message}")
+    timestamp = time.strftime('%H:%M:%S')
+    print(f"[{timestamp}] {message}")
+
+
+def write_scheduler_status(pid=None):
+    try:
+        if pid is None:
+            pid = os.getpid()
+
+        with open(PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(pid))
+
+        with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+            f.write(datetime.now().isoformat())
+    except Exception:
+        pass
+
+
+def scheduler_heartbeat_loop(stop_event):
+    while not stop_event.is_set():
+        write_scheduler_status()
+        stop_event.wait(HEARTBEAT_INTERVAL)
+
+
+def clear_scheduler_status():
+    for path in (PID_FILE, HEARTBEAT_FILE):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+
+def find_scheduler_process():
+    expected_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduler.py")
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            if not cmdline:
+                continue
+            text = " ".join(str(part) for part in cmdline).lower()
+            if "scheduler.py" in text or expected_script.lower() in text:
+                return proc.info["pid"]
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return None
+
+
+def check_scheduler_status():
+    pid = None
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+        except Exception:
+            pid = None
+
+    if pid is None or not psutil.pid_exists(pid):
+        fallback_pid = find_scheduler_process()
+        if fallback_pid is not None:
+            pid = fallback_pid
+        else:
+            clear_scheduler_status()
+            return {
+                "running": False,
+                "pid": None,
+                "message": "Scheduler chưa chạy"
+            }
+
+    heartbeat_warning = None
+    try:
+        if os.path.exists(HEARTBEAT_FILE):
+            with open(HEARTBEAT_FILE, "r", encoding="utf-8") as f:
+                heartbeat_text = f.read().strip()
+            heartbeat_dt = datetime.fromisoformat(heartbeat_text)
+            if (datetime.now() - heartbeat_dt).total_seconds() > 60:
+                heartbeat_warning = "Heartbeat quá cũ"
+    except Exception:
+        pass
+
+    message = f"Scheduler đang chạy (PID {pid})"
+    if heartbeat_warning:
+        message += f" - {heartbeat_warning}"
+
+    return {
+        "running": True,
+        "pid": pid,
+        "message": message
+    }
 
 
 def trigger_scheduler_reload(signal_file=RELOAD_SIGNAL_FILE):
@@ -69,7 +157,6 @@ def wait_for_reload_or_timeout(timeout_seconds, interval=1.0):
         time.sleep(min(interval, max(0.1, deadline - time.time())))
     return False
 
-
 # ==========================
 # SCREENSHOT
 # ==========================
@@ -104,6 +191,7 @@ def open_app(exe_path, timeout=60):
             log(f"{exe_name} đã khởi động")
             return process
 
+        write_scheduler_status()
         time.sleep(0.2)
 
     raise TimeoutError(f"Không mở được {exe_name}")
@@ -403,196 +491,210 @@ def print_next_schedule(config, from_date):
 
     print("7 ngày tới không có lịch.")
 
+
+ACTION_MAP = {
+    "open_app": open_app,
+    "close_app": close_app,
+    "click_image": click_image,
+    "wait_image": wait_image,
+    "paste": paste,
+    "sleep": time.sleep,
+}
+
+
+def execute_workflow(workflow):
+    for step in workflow:
+        write_scheduler_status()
+        action = step.get("action")
+
+        func = ACTION_MAP.get(action)
+
+        if func is None:
+            print(f"Không hỗ trợ action {action}")
+            continue
+
+        try:
+            if action in ("open_app", "close_app"):
+                func(step["path"])
+
+            elif action in ("click_image", "wait_image"):
+                func(step["image"])
+
+            elif action == "paste":
+                func(step["text"])
+
+            elif action == "sleep":
+                func(step["seconds"])
+
+        except Exception as e:
+            print(f"Lỗi action {action}: {e}")
+
+
 def scheduler():
+    write_scheduler_status()
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=scheduler_heartbeat_loop,
+        args=(heartbeat_stop,),
+        daemon=True
+    )
+    heartbeat_thread.start()
 
-    while True:
+    try:
+        while True:
+            write_scheduler_status()
 
-        now = datetime.now()
+            now = datetime.now()
 
-        # Đọc config mới nhất mỗi vòng lặp
-        config = load_config()
+            # Đọc config mới nhất mỗi vòng lặp
+            config = load_config()
 
-        weekday = str(now.weekday())
+            weekday = str(now.weekday())
 
-        day_cfg = config.get("schedule", {}).get(weekday, {})
+            day_cfg = config.get("schedule", {}).get(weekday, {})
 
-        run_list = []
+            run_list = []
 
-        # Tạo danh sách các job hôm nay
-        for job_name, cfg in day_cfg.items():
+            # Tạo danh sách các job hôm nay
+            for job_name, cfg in day_cfg.items():
+                start = cfg.get("start")
+                end = cfg.get("end")
 
-            start = cfg.get("start")
-            end = cfg.get("end")
+                if not start or not end:
+                    continue
 
-            if not start or not end:
-                continue
-
-            run_time = random_time(
-                now.date(),
-                start,
-                end
-            )
-
-            if run_time <= now:
-                continue
-
-            run_list.append(
-                (
-                    run_time,
-                    job_name
+                run_time = random_time(
+                    now.date(),
+                    start,
+                    end
                 )
-            )
 
-        # Không còn job nào hôm nay
-        if not run_list:
+                if run_time <= now:
+                    continue
 
-            tomorrow = (now + timedelta(days=1)).replace(
+                run_list.append((run_time, job_name))
+
+            # Không còn job nào hôm nay
+            if not run_list:
+                tomorrow = (now + timedelta(days=1)).replace(
+                    hour=0,
+                    minute=0,
+                    second=1,
+                    microsecond=0
+                )
+
+                print("Không có lịch hôm nay.")
+
+                while True:
+                    if consume_scheduler_reload():
+                        print("Nhận tín hiệu reload config, bắt đầu lại từ đầu.")
+                        break
+
+                    sleep_time = (tomorrow - datetime.now()).total_seconds()
+                    if sleep_time <= 0:
+                        break
+
+                    write_scheduler_status()
+                    time.sleep(min(1.0, sleep_time))
+
+                continue
+
+            # Chạy theo thứ tự thời gian
+            run_list.sort(key=lambda x: x[0])
+
+            reload_requested = False
+            for run_time, job_name in run_list:
+                while True:
+                    if consume_scheduler_reload():
+                        print("Nhận tín hiệu reload config, bắt đầu lại từ đầu.")
+                        reload_requested = True
+                        break
+
+                    wait = (run_time - datetime.now()).total_seconds()
+                    if wait <= 0:
+                        break
+
+                    print(
+                        f"Đợi đến {run_time:%d/%m/%Y %H:%M:%S} -> {job_name}"
+                    )
+                    write_scheduler_status()
+                    time.sleep(min(1.0, wait))
+
+                workflow = day_cfg[job_name].get("workflow", [])
+
+                if not workflow:
+                    print(f"{job_name} không có workflow.")
+                    continue
+
+                print(f"Đang chạy workflow: {job_name}")
+
+                execute_workflow(workflow)
+
+            if reload_requested:
+                continue
+
+            # Chờ sang ngày mới
+            today = datetime.now().date()
+
+            print(f"\nĐã hoàn thành lịch {WEEKDAY_NAME[today.weekday()]} ({today:%d/%m/%Y})")
+
+            print_next_schedule(config, today)
+
+            tomorrow = (datetime.now() + timedelta(days=1)).replace(
                 hour=0,
                 minute=0,
                 second=1,
                 microsecond=0
             )
 
-            print("Không có lịch hôm nay.")
+            sleep_time = (tomorrow - datetime.now()).total_seconds()
+
+            print(
+                f"\nScheduler ngủ {int(sleep_time)} giây đến "
+                f"{tomorrow:%d/%m/%Y %H:%M:%S}\n"
+            )
 
             while True:
                 if consume_scheduler_reload():
                     print("Nhận tín hiệu reload config, bắt đầu lại từ đầu.")
                     break
 
-                sleep_time = (tomorrow - datetime.now()).total_seconds()
-                if sleep_time <= 0:
+                remaining = (tomorrow - datetime.now()).total_seconds()
+                if remaining <= 0:
                     break
 
-                time.sleep(min(1.0, sleep_time))
+                write_scheduler_status()
+                time.sleep(min(1.0, remaining))
 
-            continue
-
-        # Chạy theo thứ tự thời gian
-        run_list.sort(key=lambda x: x[0])
-
-        reload_requested = False
-        for run_time, job_name in run_list:
-
-            while True:
-                if consume_scheduler_reload():
-                    print("Nhận tín hiệu reload config, bắt đầu lại từ đầu.")
-                    reload_requested = True
-                    break
-
-                wait = (run_time - datetime.now()).total_seconds()
-                if wait <= 0:
-                    break
-
-                print(
-                    f"Đợi đến {run_time:%d/%m/%Y %H:%M:%S} -> {job_name}"
-                )
-                time.sleep(min(1.0, wait))
-
-            if reload_requested:
-                break
-
-            # Lấy hàm theo tên
-            func = globals().get(job_name)
-
-            if not callable(func):
-                print(f"Không tìm thấy hàm '{job_name}'")
-                continue
-
-            try:
-
-                print(f"Đang chạy {job_name}")
-
-                func()
-
-            except Exception as e:
-
-                print(f"Lỗi {job_name}: {e}")
-
-        if reload_requested:
-            continue
-
-        # Chờ sang ngày mới
-        today = datetime.now().date()
-
-        print(f"\nĐã hoàn thành lịch {WEEKDAY_NAME[today.weekday()]} ({today:%d/%m/%Y})")
-
-        print_next_schedule(config, today)
-
-        tomorrow = (datetime.now() + timedelta(days=1)).replace(
-            hour=0,
-            minute=0,
-            second=1,
-            microsecond=0
-        )
-
-        sleep_time = (tomorrow - datetime.now()).total_seconds()
-
-        print(
-            f"\nScheduler ngủ {int(sleep_time)} giây đến "
-            f"{tomorrow:%d/%m/%Y %H:%M:%S}\n"
-        )
-
-        while True:
             if consume_scheduler_reload():
-                print("Nhận tín hiệu reload config, bắt đầu lại từ đầu.")
-                break
+                continue
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1)
+        clear_scheduler_status()
 
-            remaining = (tomorrow - datetime.now()).total_seconds()
-            if remaining <= 0:
-                break
+# def auto_ti():
+#     app_path = r"C:\StaffAttendantClient\StaffAttClient\StaffAttClient.exe"
+#     open_app(app_path)
+#     wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+#     paste("CK-HCM0332415")
+#     wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+#     click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+#     wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\vaoca.png")
+#     click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\vaoca.png")
+#     wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\yes.png")
+#     click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\yes.png")
+#     close_app(app_path)
 
-            time.sleep(min(1.0, remaining))
-
-        if consume_scheduler_reload():
-            continue
-# ==========================
-# DEMO
-# ==========================
-
-class Job:
-    def __init__(self):
-        self.browser_path = r"C:\Program Files\CocCoc\Browser\Application\browser.exe"
-
-    def test1(self):
-        open_app(self.browser_path)
-
-    def test2(self):
-        close_app(self.browser_path)
-
-    def auto_ti(self):
-        app_path = r"C:\StaffAttendantClient\StaffAttClient\StaffAttClient.exe"
-        open_app(app_path)
-        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-        paste("CK-HCM0332415")
-        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\vaoca.png")
-        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\vaoca.png")
-        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\yes.png")
-        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\yes.png")
-        close_app(app_path)
-
-    def auto_to(self):
-        app_path = r"C:\StaffAttendantClient\StaffAttClient\StaffAttClient.exe"
-        open_app(app_path)
-        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-        paste("CK-HCM0332415")
-        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\raca.png")
-        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\raca.png")
-        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\no.png")
-        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\no.png")
-        close_app(app_path)
-
-Jobs = Job()
-
-
-def test1():
-    Jobs.test1()
-
-
-def test2():
-    Jobs.test2()
-
+#  def auto_to():
+#     app_path = r"C:\StaffAttendantClient\StaffAttClient\StaffAttClient.exe"
+#     open_app(app_path)
+#     wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+#     paste("CK-HCM0332415")
+#     wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+#     click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+#     wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\raca.png")
+#     click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\raca.png")
+#     wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\no.png")
+#     click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\no.png")
+#     close_app(app_path)
