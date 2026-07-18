@@ -25,12 +25,31 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QFormLayout,
     QTimeEdit,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
 )
 from PyQt5.QtCore import Qt, QPoint, QRect, QSize, QTimer, QThread, pyqtSignal, QTime
-from PyQt5.QtGui import QPainter, QColor, QKeySequence, QPixmap
-from auto import click_image as auto_click_image
+from PyQt5.QtGui import QPainter, QColor, QKeySequence, QPixmap, QIntValidator
+from auto import click_image as auto_click_image, trigger_scheduler_reload, Job
 import re
 import unicodedata
+import inspect
+
+
+def get_job_function_names():
+    """
+    Lấy danh sách tên các hàm (method) công khai được định nghĩa trong
+    class Job (auto.py). Đây là các tên job hợp lệ có thể gán vào lịch,
+    vì scheduler() sẽ tìm hàm cùng tên để chạy.
+    """
+    names = []
+    for name, member in inspect.getmembers(Job, predicate=inspect.isfunction):
+        if name.startswith("_"):
+            continue
+        names.append(name)
+    return sorted(names)
 
 
 WEEKDAY_OPTIONS = [
@@ -268,12 +287,275 @@ class ElidedLabel(QLabel):
         super().setText(elided)
 
 
+class TimePickerWidget(QWidget):
+    """
+    Chọn giờ:phút bằng 2 dropdown (Giờ 00-23, Phút 00-59). So với QTimeEdit
+    (phải bấm mũi tên tăng/giảm nhiều lần), cách này cho phép:
+    - Click mở danh sách rồi chọn thẳng giá trị cần, hoặc
+    - Gõ số để nhảy nhanh tới giờ/phút mong muốn.
+    Vẫn giữ được độ chính xác tới từng phút (không giới hạn theo mốc 5/15 phút).
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self.hour_combo = QComboBox(self)
+        self.hour_combo.setEditable(True)
+        self.hour_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.hour_combo.addItems([f"{h:02d}" for h in range(24)])
+        self.hour_combo.setValidator(QIntValidator(0, 23, self.hour_combo))
+        self.hour_combo.setFixedWidth(52)
+        self.hour_combo.setMaxVisibleItems(12)
+
+        colon_label = QLabel(":")
+        colon_label.setFixedWidth(8)
+        colon_label.setAlignment(Qt.AlignCenter)
+
+        self.minute_combo = QComboBox(self)
+        self.minute_combo.setEditable(True)
+        self.minute_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.minute_combo.addItems([f"{m:02d}" for m in range(60)])
+        self.minute_combo.setValidator(QIntValidator(0, 59, self.minute_combo))
+        self.minute_combo.setFixedWidth(52)
+        self.minute_combo.setMaxVisibleItems(12)
+
+        layout.addWidget(self.hour_combo)
+        layout.addWidget(colon_label)
+        layout.addWidget(self.minute_combo)
+
+        self.now_btn = QPushButton("Now", self)
+        self.now_btn.setToolTip("Chọn giờ:phút hiện tại")
+        self.now_btn.setFixedWidth(40)
+        self.now_btn.clicked.connect(self.set_to_now)
+        layout.addWidget(self.now_btn)
+
+        layout.addStretch(1)
+
+        self.hour_combo.currentIndexChanged.connect(self.changed.emit)
+        self.minute_combo.currentIndexChanged.connect(self.changed.emit)
+
+    def _set_combo_value(self, combo, value):
+        combo.blockSignals(True)
+        try:
+            idx = combo.findText(value)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            else:
+                combo.setEditText(value)
+        finally:
+            combo.blockSignals(False)
+
+    def set_to_now(self):
+        now = QTime.currentTime()
+        self._set_combo_value(self.hour_combo, f"{now.hour():02d}")
+        self._set_combo_value(self.minute_combo, f"{now.minute():02d}")
+        self.changed.emit()
+
+    def set_time_str(self, text):
+        t = QTime.fromString(text, "HH:mm") if text else QTime()
+        if not t.isValid():
+            t = QTime(8, 0)
+        self._set_combo_value(self.hour_combo, f"{t.hour():02d}")
+        self._set_combo_value(self.minute_combo, f"{t.minute():02d}")
+
+    def time_str(self):
+        try:
+            hour = int(self.hour_combo.currentText())
+        except ValueError:
+            hour = 0
+        try:
+            minute = int(self.minute_combo.currentText())
+        except ValueError:
+            minute = 0
+        hour = max(0, min(23, hour))
+        minute = max(0, min(59, minute))
+        return f"{hour:02d}:{minute:02d}"
+
+
+class DayScheduleWidget(QWidget):
+    """
+    Widget hiển thị và chỉnh sửa danh sách job cho MỘT ngày cụ thể, dưới dạng
+    bảng (tên job / giờ bắt đầu / giờ kết thúc / nút xóa) để dễ nhìn và sửa
+    trực tiếp, thay vì phải chọn từng job trong danh sách rồi gõ lại form.
+    """
+
+    COL_NAME = 0
+    COL_START = 1
+    COL_END = 2
+    COL_ACTION = 3
+
+    def __init__(self, day_key, job_names=None, on_change=None, parent=None):
+        super().__init__(parent)
+        self.day_key = day_key
+        self.on_change = on_change
+        self.job_names = job_names or []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(8)
+
+        self.table = QTableWidget(0, 4, self)
+        self.table.setHorizontalHeaderLabels(
+            ["Tên job", "Bắt đầu", "Kết thúc", ""]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(
+            QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed
+        )
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(self.COL_NAME, QHeaderView.Stretch)
+        header.setSectionResizeMode(self.COL_START, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(self.COL_END, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(self.COL_ACTION, QHeaderView.ResizeToContents)
+
+        layout.addWidget(self.table, 1)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("+ Thêm job")
+        add_btn.clicked.connect(self.on_add_clicked)
+        btn_row.addWidget(add_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+    def _notify_change(self):
+        if self.on_change:
+            self.on_change()
+
+    def on_add_clicked(self):
+        if not self.job_names:
+            QMessageBox.warning(
+                self,
+                "Thêm job",
+                "Không tìm thấy hàm nào trong class Job (auto.py) để chọn.\n"
+                "Hãy thêm method vào class Job rồi thử lại.",
+            )
+            return
+        self.add_row()
+
+    def add_row(self, name="", start="08:00", end="09:00"):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        name_combo = QComboBox(self.table)
+        name_combo.setEditable(False)
+        if self.job_names:
+            name_combo.addItems(self.job_names)
+        else:
+            name_combo.addItem("(Không có hàm nào trong class Job)")
+            name_combo.setEnabled(False)
+
+        if name:
+            idx = name_combo.findText(name)
+            if idx >= 0:
+                name_combo.setCurrentIndex(idx)
+            else:
+                # Tên job đã lưu trước đó không còn khớp hàm nào trong class Job
+                # hiện tại -> vẫn thêm vào combobox để không làm mất dữ liệu cũ.
+                name_combo.addItem(name)
+                name_combo.setCurrentIndex(name_combo.count() - 1)
+        elif self.job_names:
+            name_combo.setCurrentIndex(0)
+
+        name_combo.currentIndexChanged.connect(self._notify_change)
+        self.table.setCellWidget(row, self.COL_NAME, name_combo)
+
+        start_widget = TimePickerWidget(self.table)
+        start_widget.set_time_str(start)
+        start_widget.changed.connect(self._notify_change)
+        self.table.setCellWidget(row, self.COL_START, start_widget)
+
+        end_widget = TimePickerWidget(self.table)
+        end_widget.set_time_str(end)
+        end_widget.changed.connect(self._notify_change)
+        self.table.setCellWidget(row, self.COL_END, end_widget)
+
+        remove_btn = QPushButton("Xóa")
+        remove_btn.setFixedWidth(60)
+        remove_btn.clicked.connect(
+            lambda checked=False, btn=remove_btn: self.remove_row_by_widget(btn)
+        )
+        self.table.setCellWidget(row, self.COL_ACTION, remove_btn)
+
+        self.table.scrollToBottom()
+        self._notify_change()
+        return row
+
+    def remove_row_by_widget(self, widget):
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, self.COL_ACTION) is widget:
+                self.table.removeRow(row)
+                break
+        self._notify_change()
+
+    def clear_rows(self):
+        self.table.setRowCount(0)
+
+    def load_jobs(self, day_cfg):
+        self.clear_rows()
+        for job_name in sorted(day_cfg.keys()):
+            cfg = day_cfg[job_name]
+            self.add_row(job_name, cfg.get("start", "08:00"), cfg.get("end", "09:00"))
+        self._notify_change()
+
+    def collect_jobs(self):
+        """
+        Trả về (dict_jobs, list_loi).
+        Các dòng chưa đặt tên sẽ được bỏ qua (không tính là lỗi).
+        Tên job trùng nhau trong cùng 1 ngày sẽ được báo lỗi.
+        """
+        jobs = {}
+        errors = []
+        for row in range(self.table.rowCount()):
+            name_combo = self.table.cellWidget(row, self.COL_NAME)
+            name = name_combo.currentText().strip() if name_combo and name_combo.isEnabled() else ""
+            if not name:
+                continue
+
+            start_widget = self.table.cellWidget(row, self.COL_START)
+            end_widget = self.table.cellWidget(row, self.COL_END)
+            start = start_widget.time_str() if start_widget else "00:00"
+            end = end_widget.time_str() if end_widget else "00:00"
+
+            if name in jobs:
+                errors.append(f"Tên job \"{name}\" bị trùng lặp.")
+                continue
+
+            jobs[name] = {"start": start, "end": end}
+        return jobs, errors
+
+    def job_count(self):
+        count = 0
+        for row in range(self.table.rowCount()):
+            name_combo = self.table.cellWidget(row, self.COL_NAME)
+            if name_combo and name_combo.isEnabled() and name_combo.currentText().strip():
+                count += 1
+        return count
+
+
 class ConfigEditorDialog(QDialog):
+    """
+    Giao diện chỉnh cấu hình lịch, được thiết kế lại để dễ dùng hơn:
+    - Mỗi ngày trong tuần là 1 tab riêng (thay vì phải chọn ngày trong combobox
+      rồi mới thấy job của ngày đó), số job trong ngày hiển thị ngay trên tab.
+    - Job của từng ngày hiển thị dạng bảng, sửa tên/giờ trực tiếp trên bảng,
+      không cần chọn job rồi gõ lại vào form riêng.
+    - Có thể sao chép nhanh lịch từ 1 ngày sang ngày đang mở (rất hữu ích khi
+      nhiều ngày có lịch giống nhau).
+    """
+
     def __init__(self, parent, config_path):
         super().__init__(parent)
         self.config_path = config_path
         self.setWindowTitle("Cấu hình lịch")
-        self.resize(760, 520)
+        self.resize(860, 580)
 
         self.schedule_data = load_config_file(config_path)
         if not isinstance(self.schedule_data, dict):
@@ -282,67 +564,55 @@ class ConfigEditorDialog(QDialog):
             self.schedule_data["schedule"] = {}
 
         layout = QVBoxLayout(self)
+
+        self.job_names = get_job_function_names()
+
         info_label = QLabel(
-            "Chọn ngày, nhập tên job và thời gian bắt đầu/kết thúc."
-            "\nHệ thống sẽ tự lưu vào file cấu hình."
+            "Mỗi tab bên dưới là 1 ngày trong tuần. Nhấn \"+ Thêm job\" để thêm job mới, "
+            "chọn tên job trong danh sách các hàm có sẵn trong class Job (auto.py), "
+            "chọn giờ trực tiếp bằng ô giờ, và nhấn \"Xóa\" ở cuối dòng để xóa job."
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("padding: 6px; background: #f5f5f5; border-radius: 4px;")
         layout.addWidget(info_label)
 
-        top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("Ngày:"))
-        self.day_combo = QComboBox(self)
+        # --- Khu vực sao chép lịch giữa các ngày ---
+        copy_row = QHBoxLayout()
+        copy_row.addWidget(QLabel("Sao chép lịch từ:"))
+        self.copy_source_combo = QComboBox(self)
         for label, value in WEEKDAY_OPTIONS:
-            self.day_combo.addItem(label, value)
-        self.day_combo.currentIndexChanged.connect(self.on_day_changed)
-        top_row.addWidget(self.day_combo, 1)
-        layout.addLayout(top_row)
+            self.copy_source_combo.addItem(label, value)
+        copy_row.addWidget(self.copy_source_combo)
 
-        body_row = QHBoxLayout()
+        copy_row.addWidget(QLabel("→ sang tab đang mở (sẽ thay thế lịch hiện tại)"))
+        copy_btn = QPushButton("Sao chép")
+        copy_btn.clicked.connect(self.on_copy_from_day)
+        copy_row.addWidget(copy_btn)
+        copy_row.addStretch(1)
+        layout.addLayout(copy_row)
 
-        left_panel = QFrame(self)
-        left_panel.setFrameShape(QFrame.StyledPanel)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.addWidget(QLabel("Danh sách job"))
-        self.job_list = QListWidget(self)
-        self.job_list.itemSelectionChanged.connect(self.on_job_selected)
-        left_layout.addWidget(self.job_list, 1)
-        body_row.addWidget(left_panel, 1)
+        # --- Tabs cho từng ngày ---
+        self.tabs = QTabWidget(self)
+        self.day_widgets = {}
+        for label, day_key in WEEKDAY_OPTIONS:
+            day_widget = DayScheduleWidget(
+                day_key,
+                job_names=self.job_names,
+                on_change=self.update_tab_titles,
+                parent=self,
+            )
+            day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(day_key, {})
+            day_widget.load_jobs(day_cfg)
+            self.day_widgets[day_key] = day_widget
+            self.tabs.addTab(day_widget, label)
 
-        right_panel = QFrame(self)
-        right_panel.setFrameShape(QFrame.StyledPanel)
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.addWidget(QLabel("Thông tin job"))
-
-        form_layout = QFormLayout()
-        self.job_name_input = QLineEdit(self)
-        self.start_time_input = QTimeEdit(self)
-        self.start_time_input.setDisplayFormat("HH:mm")
-        self.end_time_input = QTimeEdit(self)
-        self.end_time_input.setDisplayFormat("HH:mm")
-
-        form_layout.addRow("Tên job:", self.job_name_input)
-        form_layout.addRow("Bắt đầu:", self.start_time_input)
-        form_layout.addRow("Kết thúc:", self.end_time_input)
-        right_layout.addLayout(form_layout)
-
-        action_row = QHBoxLayout()
-        add_btn = QPushButton("Thêm / Cập nhật")
-        add_btn.clicked.connect(self.on_add_or_update_job)
-        remove_btn = QPushButton("Xóa")
-        remove_btn.clicked.connect(self.on_remove_job)
-        action_row.addWidget(add_btn)
-        action_row.addWidget(remove_btn)
-        right_layout.addLayout(action_row)
-        right_layout.addStretch(1)
-        body_row.addWidget(right_panel, 1)
-
-        layout.addLayout(body_row, 1)
+        self.update_tab_titles()
+        layout.addWidget(self.tabs, 1)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
         save_btn = QPushButton("Lưu")
+        save_btn.setDefault(True)
         save_btn.clicked.connect(self.on_save)
         cancel_btn = QPushButton("Hủy")
         cancel_btn.clicked.connect(self.reject)
@@ -350,82 +620,63 @@ class ConfigEditorDialog(QDialog):
         button_row.addWidget(cancel_btn)
         layout.addLayout(button_row)
 
-        self.refresh_job_list()
+    def update_tab_titles(self):
+        for index, (label, day_key) in enumerate(WEEKDAY_OPTIONS):
+            widget = self.day_widgets.get(day_key)
+            count = widget.job_count() if widget else 0
+            suffix = f" ({count})" if count else ""
+            self.tabs.setTabText(index, f"{label}{suffix}")
 
-    def current_day_key(self):
-        return self.day_combo.currentData()
+    def on_copy_from_day(self):
+        source_key = self.copy_source_combo.currentData()
+        target_index = self.tabs.currentIndex()
+        target_label, target_key = WEEKDAY_OPTIONS[target_index]
 
-    def refresh_job_list(self):
-        self.job_list.clear()
-        day_key = self.current_day_key()
-        day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(day_key, {})
-
-        for job_name in sorted(day_cfg.keys()):
-            cfg = day_cfg[job_name]
-            start = cfg.get("start", "")
-            end = cfg.get("end", "")
-            self.job_list.addItem(f"{job_name}  ({start} -> {end})")
-
-        self.job_name_input.clear()
-        self.start_time_input.setTime(QTime(0, 0))
-        self.end_time_input.setTime(QTime(0, 0))
-
-    def on_day_changed(self):
-        self.refresh_job_list()
-
-    def on_job_selected(self):
-        selected_items = self.job_list.selectedItems()
-        if not selected_items:
+        if source_key == target_key:
+            QMessageBox.information(
+                self, "Sao chép", "Ngày nguồn và ngày đích đang trùng nhau."
+            )
             return
 
-        text = selected_items[0].text()
-        job_name = text.split("  (", 1)[0]
-        day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(self.current_day_key(), {})
-        cfg = day_cfg.get(job_name, {})
+        target_widget = self.day_widgets[target_key]
+        if target_widget.job_count() > 0:
+            reply = QMessageBox.question(
+                self,
+                "Sao chép lịch",
+                f"Tab \"{target_label}\" đang có job. Sao chép sẽ THAY THẾ toàn bộ "
+                f"job hiện tại của tab này. Bạn có chắc muốn tiếp tục?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
-        self.job_name_input.setText(job_name)
-        start_time = cfg.get("start", "00:00")
-        end_time = cfg.get("end", "00:00")
-
-        try:
-            self.start_time_input.setTime(QTime.fromString(start_time, "HH:mm"))
-            self.end_time_input.setTime(QTime.fromString(end_time, "HH:mm"))
-        except Exception:
-            self.start_time_input.setTime(QTime(0, 0))
-            self.end_time_input.setTime(QTime(0, 0))
-
-    def on_add_or_update_job(self):
-        job_name = self.job_name_input.text().strip()
-        if not job_name:
-            QMessageBox.warning(self, "Cấu hình", "Vui lòng nhập tên job.")
-            return
-
-        day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(self.current_day_key(), {})
-        day_cfg[job_name] = {
-            "start": self.start_time_input.time().toString("HH:mm"),
-            "end": self.end_time_input.time().toString("HH:mm"),
-        }
-        self.refresh_job_list()
-
-        for index in range(self.job_list.count()):
-            if self.job_list.item(index).text().startswith(job_name + "  ("):
-                self.job_list.setCurrentRow(index)
-                break
-
-    def on_remove_job(self):
-        selected_items = self.job_list.selectedItems()
-        if not selected_items:
-            QMessageBox.information(self, "Cấu hình", "Chọn một job để xóa.")
-            return
-
-        job_name = selected_items[0].text().split("  (", 1)[0]
-        day_cfg = self.schedule_data.setdefault("schedule", {}).setdefault(self.current_day_key(), {})
-        day_cfg.pop(job_name, None)
-        self.refresh_job_list()
+        source_widget = self.day_widgets[source_key]
+        source_jobs, _ = source_widget.collect_jobs()
+        target_widget.load_jobs(source_jobs)
+        self.update_tab_titles()
 
     def on_save(self):
+        new_schedule = {}
+        all_errors = []
+        for label, day_key in WEEKDAY_OPTIONS:
+            jobs, errors = self.day_widgets[day_key].collect_jobs()
+            new_schedule[day_key] = jobs
+            for err in errors:
+                all_errors.append(f"[{label}] {err}")
+
+        if all_errors:
+            QMessageBox.warning(
+                self,
+                "Cấu hình",
+                "Vui lòng sửa các lỗi sau trước khi lưu:\n\n" + "\n".join(all_errors),
+            )
+            return
+
+        self.schedule_data["schedule"] = new_schedule
+
         try:
             save_config_file(self.config_path, self.schedule_data)
+            trigger_scheduler_reload()
         except Exception as e:
             QMessageBox.warning(self, "Cấu hình", f"Không thể lưu file:\n{e}")
             return

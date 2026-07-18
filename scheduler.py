@@ -1,4 +1,4 @@
-from auto import scheduler, auto_ti, auto_to, test1, test2
+from auto import scheduler
 
 if __name__ == "__main__":
 

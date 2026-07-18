@@ -15,6 +15,7 @@ import re
 pyautogui.FAILSAFE = True      # Đưa chuột lên góc trái để dừng script
 pyautogui.PAUSE = 0.1          # Nghỉ 0.1s sau mỗi thao tác
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+RELOAD_SIGNAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_reload.signal")
 WEEKDAY_NAME = [
     "Thứ 2",
     "Thứ 3",
@@ -31,6 +32,42 @@ WEEKDAY_NAME = [
 
 def log(message):
     print(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+
+def trigger_scheduler_reload(signal_file=RELOAD_SIGNAL_FILE):
+    try:
+        with open(signal_file, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        log("Đã gửi tín hiệu reload scheduler")
+        return True
+    except Exception as e:
+        log(f"Không gửi được tín hiệu reload: {e}")
+        return False
+
+
+def consume_scheduler_reload(signal_file=RELOAD_SIGNAL_FILE):
+    if not os.path.exists(signal_file):
+        return False
+
+    try:
+        with open(signal_file, "r", encoding="utf-8") as f:
+            f.read().strip()
+        os.remove(signal_file)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        log(f"Lỗi khi xử lý tín hiệu reload: {e}")
+        return False
+
+
+def wait_for_reload_or_timeout(timeout_seconds, interval=1.0):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if consume_scheduler_reload():
+            return True
+        time.sleep(min(interval, max(0.1, deadline - time.time())))
+    return False
 
 
 # ==========================
@@ -418,25 +455,42 @@ def scheduler():
 
             print("Không có lịch hôm nay.")
 
-            time.sleep(
-                (tomorrow - now).total_seconds()
-            )
+            while True:
+                if consume_scheduler_reload():
+                    print("Nhận tín hiệu reload config, bắt đầu lại từ đầu.")
+                    break
+
+                sleep_time = (tomorrow - datetime.now()).total_seconds()
+                if sleep_time <= 0:
+                    break
+
+                time.sleep(min(1.0, sleep_time))
 
             continue
 
         # Chạy theo thứ tự thời gian
         run_list.sort(key=lambda x: x[0])
 
+        reload_requested = False
         for run_time, job_name in run_list:
 
-            wait = (run_time - datetime.now()).total_seconds()
+            while True:
+                if consume_scheduler_reload():
+                    print("Nhận tín hiệu reload config, bắt đầu lại từ đầu.")
+                    reload_requested = True
+                    break
 
-            if wait > 0:
+                wait = (run_time - datetime.now()).total_seconds()
+                if wait <= 0:
+                    break
+
                 print(
                     f"Đợi đến {run_time:%d/%m/%Y %H:%M:%S} -> {job_name}"
                 )
+                time.sleep(min(1.0, wait))
 
-                time.sleep(wait)
+            if reload_requested:
+                break
 
             # Lấy hàm theo tên
             func = globals().get(job_name)
@@ -454,6 +508,9 @@ def scheduler():
             except Exception as e:
 
                 print(f"Lỗi {job_name}: {e}")
+
+        if reload_requested:
+            continue
 
         # Chờ sang ngày mới
         today = datetime.now().date()
@@ -476,41 +533,66 @@ def scheduler():
             f"{tomorrow:%d/%m/%Y %H:%M:%S}\n"
         )
 
-        time.sleep(sleep_time)
+        while True:
+            if consume_scheduler_reload():
+                print("Nhận tín hiệu reload config, bắt đầu lại từ đầu.")
+                break
+
+            remaining = (tomorrow - datetime.now()).total_seconds()
+            if remaining <= 0:
+                break
+
+            time.sleep(min(1.0, remaining))
+
+        if consume_scheduler_reload():
+            continue
 # ==========================
 # DEMO
 # ==========================
 
-def auto_ti():
-    app_path = r"C:\StaffAttendantClient\StaffAttClient\StaffAttClient.exe"
-    open_app(app_path
-    )
-    wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-    paste("CK-HCM0332415")
-    wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-    click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-    wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\vaoca.png")
-    click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\vaoca.png")
-    wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\yes.png")
-    click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\yes.png")
-    close_app(app_path)
+class Job:
+    def __init__(self):
+        self.browser_path = r"C:\Program Files\CocCoc\Browser\Application\browser.exe"
 
-def auto_to():
-    app_path = r"C:\StaffAttendantClient\StaffAttClient\StaffAttClient.exe"
-    open_app(app_path
-    )
-    wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-    paste("CK-HCM0332415")
-    wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-    click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
-    wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\raca.png")
-    click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\raca.png")
-    wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\no.png")
-    click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\no.png")
-    close_app(app_path)
+    def test1(self):
+        open_app(self.browser_path)
+
+    def test2(self):
+        close_app(self.browser_path)
+
+    def auto_ti(self):
+        app_path = r"C:\StaffAttendantClient\StaffAttClient\StaffAttClient.exe"
+        open_app(app_path)
+        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+        paste("CK-HCM0332415")
+        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\vaoca.png")
+        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\vaoca.png")
+        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\yes.png")
+        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\yes.png")
+        close_app(app_path)
+
+    def auto_to(self):
+        app_path = r"C:\StaffAttendantClient\StaffAttClient\StaffAttClient.exe"
+        open_app(app_path)
+        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+        paste("CK-HCM0332415")
+        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\xacnhan.png")
+        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\raca.png")
+        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\raca.png")
+        wait_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\no.png")
+        click_image(r"C:\Users\POS01\Downloads\OT\pyautogui-package-main\Images\no.png")
+        close_app(app_path)
+
+Jobs = Job()
+
 
 def test1():
-    open_app(r"C:\Program Files\CocCoc\Browser\Application\browser.exe")
+    Jobs.test1()
+
+
 def test2():
-    close_app(r"C:\Program Files\CocCoc\Browser\Application\browser.exe")
+    Jobs.test2()
 
